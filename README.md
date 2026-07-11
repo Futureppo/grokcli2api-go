@@ -14,14 +14,15 @@
 
 - 支持 OpenAI Chat Completions API
 - 支持 OpenAI Responses API
+- 支持 Grok CLI 原生 Responses 透传
 - 支持 Anthropic Messages API
 - 支持流式与非流式响应
 - 支持多账号 OAuth 凭证池、自动刷新和目录热加载
 - 支持会话亲和、账号轮询、自动重试和额度冷却
+- 支持账号级并发上限和容量背压，减少高并发 429 重试
 - 可配置本地 API Key 访问保护
 - 支持 HTTP、HTTPS、SOCKS5 和 SOCKS5H 出站代理
 - 按账号发现并聚合上游模型，按模型能力调度请求
-- Grok 只读透传接口
 - 仅使用 Go 标准库，便于构建和部署
 
 ## API 兼容性
@@ -165,6 +166,7 @@ curl http://localhost:8088/v1/messages \
 | `GROK_AUTHS_DIR` | `./auths` | 非递归扫描的可写 OAuth JSON 目录 |
 | `GROK_AUTHS_RELOAD_INTERVAL` | `30s` | 凭证目录热加载周期 |
 | `GROK_AUTH_REFRESH_CONCURRENCY` | `4` | OAuth 刷新并发数 |
+| `GROK_ACCOUNT_MAX_INFLIGHT` | `16` | 每账号最大上游在途请求数；超出后等待可用容量 |
 | `GROK_MODELS_REFRESH_INTERVAL` | `6h` | 每个账号模型目录的刷新周期 |
 | `GROK_RETRY_MAX_ATTEMPTS` | `3` | 单个请求最多尝试的不同账号数 |
 | `GROK_RETRY_BASE_DELAY` | `200ms` | 可重试网络与 5xx 错误的基础退避 |

@@ -20,11 +20,14 @@ import (
 
 const stateFileName = ".grokcli2api-state.json"
 
+var errAccountBusy = errors.New("credential account is at its in-flight limit")
+
 type PoolConfig struct {
 	Dir                string
 	Surface            string
 	ReloadInterval     time.Duration
 	RefreshConcurrency int
+	AccountMaxInflight int
 	AffinityTTL        time.Duration
 	AffinityMaxEntries int
 }
@@ -116,10 +119,12 @@ type Pool struct {
 	cursor        atomic.Uint64
 	affinity      *affinityCache
 	refreshSem    chan struct{}
+	capacityCh    chan struct{}
 	rebuildCh     chan struct{}
 	closed        chan struct{}
 	closeOnce     sync.Once
 	wg            sync.WaitGroup
+	stateMu       sync.Mutex
 }
 
 type Lease struct {
@@ -142,7 +147,10 @@ func (l *Lease) Release() {
 	if l == nil || l.account == nil {
 		return
 	}
-	l.once.Do(func() { l.account.inflight.Add(-1) })
+	l.once.Do(func() {
+		l.account.inflight.Add(-1)
+		l.pool.notifyCapacity()
+	})
 }
 
 func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, error) {
@@ -154,6 +162,9 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 	}
 	if cfg.RefreshConcurrency < 1 {
 		cfg.RefreshConcurrency = 4
+	}
+	if cfg.AccountMaxInflight < 1 {
+		cfg.AccountMaxInflight = 16
 	}
 	if cfg.AffinityTTL <= 0 {
 		cfg.AffinityTTL = time.Hour
@@ -167,7 +178,8 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 	p := &Pool{
 		cfg: cfg, http: client, accounts: map[string]*account{}, files: map[string]fileEntry{},
 		states: map[string]accountState{}, affinity: newAffinityCache(cfg.AffinityTTL, cfg.AffinityMaxEntries),
-		refreshSem: make(chan struct{}, cfg.RefreshConcurrency), rebuildCh: make(chan struct{}, 1), closed: make(chan struct{}),
+		refreshSem: make(chan struct{}, cfg.RefreshConcurrency), capacityCh: make(chan struct{}, 1),
+		rebuildCh: make(chan struct{}, 1), closed: make(chan struct{}),
 	}
 	p.active.Store([]*account{})
 	p.activeByModel.Store(map[string][]*account{})
@@ -202,44 +214,99 @@ func (p *Pool) Close() {
 
 func (p *Pool) Acquire(ctx context.Context, affinity, model string, exclude map[string]struct{}) (*Lease, error) {
 	cacheKey := modelAffinityKey(affinity, model)
-	if affinity != "" {
-		if id, ok := p.affinity.Get(cacheKey); ok {
-			if lease, err := p.acquireID(ctx, id, model, exclude); err == nil {
-				return lease, nil
-			}
-			p.affinity.Delete(cacheKey)
-		}
-	}
-	active := p.schedulingSnapshot(model)
-	if len(active) == 0 {
-		p.rebuildActive()
-		active = p.schedulingSnapshot(model)
-		if len(active) == 0 {
-			if model != "" && !p.HasModel(model) {
-				return nil, &ModelUnavailableError{Model: model}
-			}
-			return nil, p.unavailable()
-		}
-	}
-	start := int(p.cursor.Add(1)-1) % len(active)
-	for i := 0; i < len(active); i++ {
-		a := active[(start+i)%len(active)]
-		if _, skipped := exclude[a.id]; skipped || !a.available(time.Now()) || !a.supportsModel(model) {
-			continue
-		}
-		if err := p.ensureFresh(ctx, a, false); err != nil {
-			continue
-		}
-		a.inflight.Add(1)
+	for {
 		if affinity != "" {
-			p.affinity.Set(cacheKey, a.id)
+			if id, ok := p.affinity.Get(cacheKey); ok {
+				lease, err := p.acquireID(ctx, id, model, exclude)
+				if err == nil {
+					return lease, nil
+				}
+				if errors.Is(err, errAccountBusy) {
+					if err := p.waitForCapacity(ctx); err != nil {
+						return nil, err
+					}
+					continue
+				}
+				p.affinity.Delete(cacheKey)
+			}
 		}
-		return &Lease{pool: p, account: a}, nil
+		active := p.schedulingSnapshot(model)
+		if len(active) == 0 {
+			p.rebuildActive()
+			active = p.schedulingSnapshot(model)
+			if len(active) == 0 {
+				if model != "" && !p.HasModel(model) {
+					return nil, &ModelUnavailableError{Model: model}
+				}
+				return nil, p.unavailable()
+			}
+		}
+		start := int(p.cursor.Add(1)-1) % len(active)
+		saturated := false
+		for i := 0; i < len(active); i++ {
+			a := active[(start+i)%len(active)]
+			if _, skipped := exclude[a.id]; skipped || !a.available(time.Now()) || !a.supportsModel(model) {
+				continue
+			}
+			if !a.tryAcquire(p.cfg.AccountMaxInflight) {
+				saturated = true
+				continue
+			}
+			if err := p.ensureFresh(ctx, a, false); err != nil {
+				a.inflight.Add(-1)
+				p.notifyCapacity()
+				continue
+			}
+			if affinity != "" {
+				p.affinity.Set(cacheKey, a.id)
+			}
+			return &Lease{pool: p, account: a}, nil
+		}
+		if saturated {
+			if err := p.waitForCapacity(ctx); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if model != "" && !p.HasModel(model) {
+			return nil, &ModelUnavailableError{Model: model}
+		}
+		return nil, p.unavailable()
 	}
-	if model != "" && !p.HasModel(model) {
-		return nil, &ModelUnavailableError{Model: model}
+}
+
+func (a *account) tryAcquire(limit int) bool {
+	if limit < 1 {
+		a.inflight.Add(1)
+		return true
 	}
-	return nil, p.unavailable()
+	for {
+		current := a.inflight.Load()
+		if current >= int64(limit) {
+			return false
+		}
+		if a.inflight.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func (p *Pool) notifyCapacity() {
+	select {
+	case p.capacityCh <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Pool) waitForCapacity(ctx context.Context) error {
+	select {
+	case <-p.capacityCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.closed:
+		return ErrNoAuth
+	}
 }
 
 func (p *Pool) schedulingSnapshot(model string) []*account {
@@ -250,7 +317,15 @@ func (p *Pool) schedulingSnapshot(model string) []*account {
 }
 
 func (p *Pool) AcquireAccount(ctx context.Context, id string) (*Lease, error) {
-	return p.acquireID(ctx, id, "", nil)
+	for {
+		lease, err := p.acquireID(ctx, id, "", nil)
+		if !errors.Is(err, errAccountBusy) {
+			return lease, err
+		}
+		if err := p.waitForCapacity(ctx); err != nil {
+			return nil, err
+		}
+	}
 }
 
 // AcquireAccountForMetadata ignores quota/rate cooldowns so non-generative
@@ -283,10 +358,14 @@ func (p *Pool) acquireID(ctx context.Context, id, model string, exclude map[stri
 	if a == nil || !a.available(time.Now()) || !a.supportsModel(model) {
 		return nil, ErrNoAuth
 	}
+	if !a.tryAcquire(p.cfg.AccountMaxInflight) {
+		return nil, errAccountBusy
+	}
 	if err := p.ensureFresh(ctx, a, false); err != nil {
+		a.inflight.Add(-1)
+		p.notifyCapacity()
 		return nil, err
 	}
-	a.inflight.Add(1)
 	return &Lease{pool: p, account: a}, nil
 }
 
@@ -429,18 +508,45 @@ func (p *Pool) MarkCooldown(accountID, reason string, duration time.Duration) {
 	if a == nil {
 		return
 	}
+	now := time.Now()
+	until := now.Add(duration)
 	a.mu.Lock()
-	until := time.Now().Add(duration)
-	if until.After(a.cooldownUntil) {
+	remaining := time.Until(a.cooldownUntil)
+	extensionThreshold := remaining / 10
+	if extensionThreshold < 5*time.Second {
+		extensionThreshold = 5 * time.Second
+	}
+	changed := !now.Before(a.cooldownUntil) || until.After(a.cooldownUntil.Add(extensionThreshold))
+	if changed {
 		a.cooldownUntil, a.cooldownCause = until, reason
+	} else {
+		until = a.cooldownUntil
+		reason = a.cooldownCause
 	}
 	a.mu.Unlock()
+	if !changed {
+		return
+	}
 	p.mu.Lock()
 	p.states[accountID] = accountState{CooldownUntil: until, Reason: reason}
 	p.mu.Unlock()
 	p.requestRebuild()
+	p.rebuildWhenCooldownExpires(until)
 	_ = p.persistState()
 	slog.Warn("credential account cooling", "account", accountID, "reason", reason, "until", until.UTC().Format(time.RFC3339))
+}
+
+func (p *Pool) rebuildWhenCooldownExpires(until time.Time) {
+	go func() {
+		timer := time.NewTimer(time.Until(until))
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			p.rebuildActive()
+			p.notifyCapacity()
+		case <-p.closed:
+		}
+	}()
 }
 
 func (p *Pool) Disable(accountID, reason string) {
@@ -451,8 +557,12 @@ func (p *Pool) Disable(accountID, reason string) {
 		return
 	}
 	a.mu.Lock()
+	changed := !a.disabled || a.disableReason != reason
 	a.disabled, a.disableReason = true, reason
 	a.mu.Unlock()
+	if !changed {
+		return
+	}
 	p.mu.Lock()
 	p.states[accountID] = accountState{Disabled: true, Reason: reason}
 	p.mu.Unlock()
@@ -584,6 +694,7 @@ func (p *Pool) ensureFresh(ctx context.Context, a *account, force bool) error {
 	}
 	p.mu.Unlock()
 	p.requestRebuild()
+	p.notifyCapacity()
 	slog.Info("credential refreshed", "account", a.id)
 	return nil
 }
@@ -712,12 +823,24 @@ func (p *Pool) scan() error {
 		return ErrNoAuth
 	}
 	p.mu.Lock()
+	poolChanged := len(p.files) != len(newFiles) || len(p.accounts) != len(parsed)
+	if !poolChanged {
+		for path, next := range newFiles {
+			current, ok := p.files[path]
+			if !ok || current.size != next.size || !current.modTime.Equal(next.modTime) {
+				poolChanged = true
+				break
+			}
+		}
+	}
+	var cooldowns []time.Time
 	for id, cred := range parsed {
 		if existing := p.accounts[id]; existing != nil {
 			existing.mu.Lock()
-			changed := existing.credential == nil || existing.credential.Path != cred.Path || existing.credential.AccessToken != cred.AccessToken || existing.credential.RefreshToken != cred.RefreshToken
+			credentialChanged := existing.credential == nil || existing.credential.Path != cred.Path || existing.credential.AccessToken != cred.AccessToken || existing.credential.RefreshToken != cred.RefreshToken
 			existing.credential = cred
-			if changed {
+			if credentialChanged {
+				poolChanged = true
 				existing.disabled = false
 				existing.disableReason = ""
 				existing.cooldownUntil = time.Time{}
@@ -733,9 +856,11 @@ func (p *Pool) scan() error {
 				a.disabled, a.disableReason = true, state.Reason
 			} else if time.Now().Before(state.CooldownUntil) {
 				a.cooldownUntil, a.cooldownCause = state.CooldownUntil, state.Reason
+				cooldowns = append(cooldowns, state.CooldownUntil)
 			}
 		}
 		p.accounts[id] = a
+		poolChanged = true
 	}
 	for id, a := range p.accounts {
 		if _, ok := parsed[id]; !ok {
@@ -743,13 +868,20 @@ func (p *Pool) scan() error {
 			a.disabled, a.disableReason = true, "removed"
 			a.mu.Unlock()
 			delete(p.accounts, id)
+			poolChanged = true
 		}
 	}
 	p.files = newFiles
 	count := len(p.accounts)
 	p.mu.Unlock()
-	p.rebuildActive()
-	slog.Info("credential pool loaded", "accounts", count)
+	for _, until := range cooldowns {
+		p.rebuildWhenCooldownExpires(until)
+	}
+	if poolChanged {
+		p.rebuildActive()
+		p.notifyCapacity()
+		slog.Info("credential pool loaded", "accounts", count)
+	}
 	return nil
 }
 
@@ -858,6 +990,8 @@ func (p *Pool) loadState() error {
 }
 
 func (p *Pool) persistState() error {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
 	p.mu.RLock()
 	state := persistedState{Version: 1, Accounts: map[string]accountState{}}
 	for id, item := range p.states {

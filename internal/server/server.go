@@ -36,7 +36,8 @@ func New(cfg config.Config) (*Server, error) {
 	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
 		Dir: cfg.AuthsDir, Surface: cfg.ClientSurface,
 		ReloadInterval: cfg.AuthsReloadInterval, RefreshConcurrency: cfg.AuthRefreshConcurrency,
-		AffinityTTL: cfg.AffinityTTL, AffinityMaxEntries: cfg.AffinityMaxEntries,
+		AccountMaxInflight: cfg.AccountMaxInflight,
+		AffinityTTL:        cfg.AffinityTTL, AffinityMaxEntries: cfg.AffinityMaxEntries,
 	}, httpClient)
 	if err != nil {
 		return nil, err

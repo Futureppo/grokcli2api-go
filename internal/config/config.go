@@ -21,6 +21,7 @@ type Config struct {
 	AuthsDir               string
 	AuthsReloadInterval    time.Duration
 	AuthRefreshConcurrency int
+	AccountMaxInflight     int
 	ModelsRefreshInterval  time.Duration
 	RetryMaxAttempts       int
 	RetryBaseDelay         time.Duration
@@ -48,6 +49,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	refreshConcurrency, err := envPositiveInt("GROK_AUTH_REFRESH_CONCURRENCY", 4)
+	if err != nil {
+		return Config{}, err
+	}
+	accountMaxInflight, err := envPositiveInt("GROK_ACCOUNT_MAX_INFLIGHT", 16)
 	if err != nil {
 		return Config{}, err
 	}
@@ -92,6 +97,7 @@ func Load() (Config, error) {
 		AuthsDir:               expandHome(env("GROK_AUTHS_DIR", "./auths")),
 		AuthsReloadInterval:    reloadInterval,
 		AuthRefreshConcurrency: refreshConcurrency,
+		AccountMaxInflight:     accountMaxInflight,
 		ModelsRefreshInterval:  modelsRefreshInterval,
 		RetryMaxAttempts:       retryAttempts,
 		RetryBaseDelay:         retryBaseDelay,

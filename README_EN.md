@@ -14,14 +14,15 @@
 
 - OpenAI Chat Completions API compatibility
 - OpenAI Responses API compatibility
+- Grok CLI native Responses passthrough
 - Anthropic Messages API compatibility
 - Streaming and non-streaming responses
 - Multi-account OAuth pool with automatic refresh and directory hot reload
 - Session affinity, account rotation, retries, and quota cooldowns
+- Per-account concurrency limits and capacity backpressure to reduce 429 retry storms
 - Optional local API-key protection
 - HTTP, HTTPS, SOCKS5, and SOCKS5H outbound proxies
 - Per-account upstream model discovery, aggregation, and capability-aware scheduling
-- Read-only Grok passthrough endpoints
 - Standard-library-only Go implementation for simple builds and deployments
 
 ## API compatibility
@@ -165,6 +166,7 @@ The service loads environment variables that are not already set from a `.env` f
 | `GROK_AUTHS_DIR` | `./auths` | Writable, non-recursive OAuth JSON directory |
 | `GROK_AUTHS_RELOAD_INTERVAL` | `30s` | Credential hot-reload interval |
 | `GROK_AUTH_REFRESH_CONCURRENCY` | `4` | Maximum concurrent OAuth refreshes |
+| `GROK_ACCOUNT_MAX_INFLIGHT` | `16` | Maximum upstream requests in flight per account; excess requests wait for capacity |
 | `GROK_MODELS_REFRESH_INTERVAL` | `6h` | Per-account model-catalog refresh interval |
 | `GROK_RETRY_MAX_ATTEMPTS` | `3` | Maximum distinct accounts tried per request |
 | `GROK_RETRY_BASE_DELAY` | `200ms` | Base delay for retryable network and 5xx failures |

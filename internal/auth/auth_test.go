@@ -179,6 +179,90 @@ func TestPoolRoundRobinAffinityAndConcurrentLease(t *testing.T) {
 	wg.Wait()
 }
 
+func TestPoolWaitsForPerAccountCapacity(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	pool.cfg.AccountMaxInflight = 2
+
+	first, err := pool.Acquire(context.Background(), "", "grok-4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := pool.Acquire(context.Background(), "", "grok-4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := make(chan *Lease, 1)
+	errorsCh := make(chan error, 1)
+	go func() {
+		lease, acquireErr := pool.Acquire(ctx, "", "grok-4", nil)
+		if acquireErr != nil {
+			errorsCh <- acquireErr
+			return
+		}
+		result <- lease
+	}()
+	select {
+	case lease := <-result:
+		lease.Release()
+		t.Fatal("third request bypassed the per-account in-flight limit")
+	case err := <-errorsCh:
+		t.Fatal(err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	first.Release()
+	select {
+	case lease := <-result:
+		lease.Release()
+	case err := <-errorsCh:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("waiting request was not notified when account capacity became available")
+	}
+	second.Release()
+}
+
+func TestCooldownUpdatesAreCoalescedAndExpireWithoutDirectoryScan(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+	writeTestCredential(t, dir, "b.json", "subject-b", "token-b", time.Now().Add(time.Hour), "")
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	id := accountID("subject-a")
+
+	pool.MarkCooldown(id, "rate_limited", 100*time.Millisecond)
+	pool.mu.RLock()
+	firstUntil := pool.states[id].CooldownUntil
+	pool.mu.RUnlock()
+	time.Sleep(10 * time.Millisecond)
+	pool.MarkCooldown(id, "rate_limited", 100*time.Millisecond)
+	pool.mu.RLock()
+	secondUntil := pool.states[id].CooldownUntil
+	pool.mu.RUnlock()
+	if !secondUntil.Equal(firstUntil) {
+		t.Fatalf("duplicate cooldown extended from %s to %s", firstUntil, secondUntil)
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for len(pool.schedulingSnapshot("grok-4")) != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := len(pool.schedulingSnapshot("grok-4")); got != 1 {
+		t.Fatalf("active model snapshot contains %d accounts during cooldown, want 1", got)
+	}
+	deadline = time.Now().Add(time.Second)
+	for len(pool.schedulingSnapshot("grok-4")) != 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := len(pool.schedulingSnapshot("grok-4")); got != 2 {
+		t.Fatalf("active model snapshot contains %d accounts after cooldown expiry, want 2", got)
+	}
+}
+
 func TestPoolDeduplicatesAccountsBySubject(t *testing.T) {
 	dir := t.TempDir()
 	writeTestCredential(t, dir, "a.json", "same-subject", "token-a", time.Now().Add(time.Hour), "")
