@@ -111,6 +111,9 @@ func Prepare(body map[string]any) (Prepared, error) {
 		existing, _ := out["tools"].([]any)
 		out["tools"] = append(existing, mcpTools...)
 	}
+	if err := normalizeUpstreamTools(out); err != nil {
+		return Prepared{}, err
+	}
 	warnings := []string{}
 	for _, key := range []string{"service_tier", "context_management", "container"} {
 		if _, ok := body[key]; ok {
@@ -268,21 +271,10 @@ func convertDocument(block map[string]any) (map[string]any, error) {
 
 func convertTools(tools []any) ([]any, error) {
 	out := make([]any, 0, len(tools))
-	for _, raw := range tools {
+	for index, raw := range tools {
 		tool, ok := raw.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("tools entries must be objects")
-		}
-		if name := stringValue(tool["name"]); name != "" {
-			converted := map[string]any{"type": "function", "name": name, "parameters": tool["input_schema"]}
-			if description, ok := tool["description"]; ok {
-				converted["description"] = description
-			}
-			if strict, ok := tool["strict"]; ok {
-				converted["strict"] = strict
-			}
-			out = append(out, converted)
-			continue
+			return nil, fmt.Errorf("tools[%d] must be an object", index)
 		}
 		kind := stringValue(tool["type"])
 		if strings.HasPrefix(kind, "web_search_") {
@@ -295,9 +287,70 @@ func convertTools(tools []any) ([]any, error) {
 			out = append(out, converted)
 			continue
 		}
-		return nil, fmt.Errorf("unsupported Anthropic tool type %q", kind)
+		if name := stringValue(tool["name"]); name != "" {
+			parameters, ok := tool["input_schema"].(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("tools[%d] %q input_schema must be an object", index, name)
+			}
+			converted := map[string]any{"type": "function", "name": name, "parameters": parameters}
+			if description, ok := tool["description"]; ok {
+				converted["description"] = description
+			}
+			if strict, ok := tool["strict"]; ok {
+				converted["strict"] = strict
+			}
+			out = append(out, converted)
+			continue
+		}
+		if kind == "" {
+			return nil, fmt.Errorf("tools[%d] is missing type and name", index)
+		}
+		return nil, fmt.Errorf("unsupported Anthropic tool type %q at tools[%d]", kind, index)
 	}
 	return out, nil
+}
+
+// normalizeUpstreamTools is the final guard on the Anthropic request path.
+// Every tool sent to the Grok Responses endpoint must carry a discriminator;
+// named tools without one are ordinary function tools in the Anthropic API.
+func normalizeUpstreamTools(body map[string]any) error {
+	raw, exists := body["tools"]
+	if !exists {
+		return nil
+	}
+	tools, ok := raw.([]any)
+	if !ok {
+		return fmt.Errorf("tools must be an array")
+	}
+	for index, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			return fmt.Errorf("tools[%d] must be an object", index)
+		}
+		kind := strings.TrimSpace(stringValue(tool["type"]))
+		if kind == "" {
+			if strings.TrimSpace(stringValue(tool["name"])) == "" {
+				return fmt.Errorf("tools[%d] is missing type and name", index)
+			}
+			tool["type"] = "function"
+			kind = "function"
+		}
+		switch kind {
+		case "function":
+			if strings.TrimSpace(stringValue(tool["name"])) == "" {
+				return fmt.Errorf("tools[%d] function is missing name", index)
+			}
+			if _, ok := tool["parameters"].(map[string]any); !ok {
+				return fmt.Errorf("tools[%d] function parameters must be an object", index)
+			}
+		case "web_search", "mcp":
+			// These hosted tools have their own required fields and already come
+			// from the dedicated converters above.
+		default:
+			return fmt.Errorf("tools[%d] has unsupported upstream type %q", index, kind)
+		}
+	}
+	return nil
 }
 
 func convertToolChoice(choice map[string]any) (any, error) {

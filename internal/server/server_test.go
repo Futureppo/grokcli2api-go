@@ -387,6 +387,64 @@ func TestAnthropicMessagesAndXAPIKey(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesAlwaysSendsToolTypes(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		stream := stream
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				tools, ok := body["tools"].([]any)
+				if !ok || len(tools) != 1 {
+					t.Errorf("tools=%#v", body["tools"])
+				} else {
+					tool, _ := tools[0].(map[string]any)
+					if tool["type"] != "function" || tool["name"] != "Read" {
+						t.Errorf("tool=%#v", tool)
+					}
+					parameters, _ := tool["parameters"].(map[string]any)
+					if parameters["type"] != "object" {
+						t.Errorf("parameters=%#v", parameters)
+					}
+				}
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":2}}}\n\n")
+					_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n")
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{
+					"id": "resp_1", "output": []any{}, "usage": map[string]any{"input_tokens": 2, "output_tokens": 0},
+				})
+			}))
+			defer upstream.Close()
+
+			requestBody := map[string]any{
+				"model": "grok-4", "max_tokens": 128, "stream": stream,
+				"messages": []any{map[string]any{"role": "user", "content": "read a file"}},
+				"tools": []any{map[string]any{
+					"name": "Read", "description": "Read a file",
+					"input_schema": map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}},
+				}},
+			}
+			encoded, err := json.Marshal(requestBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := newTestHandler(t, upstream.URL, nil)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(encoded))))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestAnthropicMessagesStreamingSequence(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

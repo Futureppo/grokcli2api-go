@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/Futureppo/grokcli2api-go/internal/grok"
@@ -39,6 +40,101 @@ func TestPrepareMapsMultimodalToolsAndThinking(t *testing.T) {
 		if !contains(text, expected) {
 			t.Fatalf("%q missing from %s", expected, text)
 		}
+	}
+	tools := prepared.Body["tools"].([]any)
+	tool := tools[0].(map[string]any)
+	if tool["type"] != "function" || tool["name"] != "lookup" {
+		t.Fatalf("tool=%#v", tool)
+	}
+}
+
+func TestPrepareCanonicalizesClaudeCodeTools(t *testing.T) {
+	properties := make(map[string]any, 512)
+	for i := 0; i < 512; i++ {
+		properties[fmt.Sprintf("field_%03d", i)] = map[string]any{
+			"type": "string", "description": "A deliberately verbose Claude Code tool property used for regression coverage.",
+		}
+	}
+	schema := map[string]any{
+		"type": "object", "properties": properties, "required": []any{"field_000"}, "additionalProperties": false,
+	}
+	body := map[string]any{
+		"model": "grok-4", "max_tokens": float64(1024),
+		"messages": []any{map[string]any{"role": "user", "content": "inspect the repository"}},
+		"tools": []any{map[string]any{
+			"name": "Read", "description": "Read a file", "input_schema": schema, "strict": true,
+			"cache_control": map[string]any{"type": "ephemeral"},
+		}},
+		"mcp_servers": []any{map[string]any{"name": "github", "url": "https://example.test/mcp"}},
+	}
+	prepared, err := Prepare(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := prepared.Body["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools=%#v", tools)
+	}
+	function := tools[0].(map[string]any)
+	parameters, ok := function["parameters"].(map[string]any)
+	if function["type"] != "function" || function["name"] != "Read" || !ok || len(parameters["properties"].(map[string]any)) != 512 || function["strict"] != true {
+		t.Fatalf("function=%#v", function)
+	}
+	if _, exists := function["cache_control"]; exists {
+		t.Fatalf("unsupported cache_control leaked upstream: %#v", function)
+	}
+	mcp := tools[1].(map[string]any)
+	if mcp["type"] != "mcp" || mcp["server_label"] != "github" {
+		t.Fatalf("mcp=%#v", mcp)
+	}
+	encoded, err := json.Marshal(prepared.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) < 32<<10 || !contains(string(encoded), `"type":"function"`) {
+		t.Fatalf("large request was not serialized with a tool type: bytes=%d", len(encoded))
+	}
+}
+
+func TestPreparePreservesAnthropicWebSearchTool(t *testing.T) {
+	prepared, err := Prepare(map[string]any{
+		"model": "grok-4", "max_tokens": float64(128),
+		"messages": []any{map[string]any{"role": "user", "content": "search"}},
+		"tools":    []any{map[string]any{"type": "web_search_20250305", "name": "web_search", "max_uses": float64(3)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := prepared.Body["tools"].([]any)[0].(map[string]any)
+	if tool["type"] != "web_search" || tool["max_uses"] != float64(3) {
+		t.Fatalf("tool=%#v", tool)
+	}
+}
+
+func TestNormalizeUpstreamToolsInfersOrRejectsMissingType(t *testing.T) {
+	body := map[string]any{"tools": []any{map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}}}
+	if err := normalizeUpstreamTools(body); err != nil {
+		t.Fatal(err)
+	}
+	tool := body["tools"].([]any)[0].(map[string]any)
+	if tool["type"] != "function" {
+		t.Fatalf("tool=%#v", tool)
+	}
+
+	err := normalizeUpstreamTools(map[string]any{"tools": []any{map[string]any{"description": "unknown"}}})
+	if err == nil || !contains(err.Error(), "missing type and name") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestPrepareRejectsToolWithoutTypeOrNameLocally(t *testing.T) {
+	_, err := Prepare(map[string]any{
+		"model": "grok-4", "max_tokens": float64(128),
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+		"tools":    []any{map[string]any{"description": "unknown tool shape"}},
+	})
+	if err == nil || !contains(err.Error(), "tools[0] is missing type and name") {
+		t.Fatalf("err=%v", err)
 	}
 }
 
