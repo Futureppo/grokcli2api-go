@@ -102,9 +102,9 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "grokcli2api-go", "version": config.Version,
-		"openai_compat_endpoints":    []string{"/v1/chat/completions", "/v1/responses", "/v1/models"},
-		"anthropic_compat_endpoints": []string{"/v1/messages"},
+		"name":    "grokcli2api-go",
+		"version": config.Version,
+		"project": "https://github.com/Futureppo/grokcli2api-go",
 	})
 }
 

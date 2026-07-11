@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,27 @@ import (
 
 	"github.com/Futureppo/grokcli2api-go/internal/config"
 )
+
+func TestRootServiceInfo(t *testing.T) {
+	rec := httptest.NewRecorder()
+	(&Server{}).root(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{
+		"name":    "grokcli2api-go",
+		"version": config.Version,
+		"project": "https://github.com/Futureppo/grokcli2api-go",
+	}
+	if !reflect.DeepEqual(response, want) {
+		t.Fatalf("response = %#v, want %#v", response, want)
+	}
+}
 
 func TestAPIKeyGateAndChatProxy(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
