@@ -16,10 +16,11 @@
 - OpenAI Responses API compatibility
 - Anthropic Messages API compatibility
 - Streaming and non-streaming responses
-- Grok CLI SessionToken and local authentication-file support
+- Multi-account OAuth pool with automatic refresh and directory hot reload
+- Session affinity, account rotation, retries, and quota cooldowns
 - Optional local API-key protection
 - HTTP, HTTPS, SOCKS5, and SOCKS5H outbound proxies
-- Built-in health checks, model discovery, OpenAPI documentation, and Swagger UI
+- Built-in model discovery and read-only Grok passthrough endpoints
 - Standard-library-only Go implementation for simple builds and deployments
 
 ## API compatibility
@@ -38,7 +39,7 @@ The compatibility layer preserves commonly used request and response formats whe
 ### Requirements
 
 - Go 1.23 or later
-- A valid Grok CLI SessionToken or an authentication file created by a signed-in Grok CLI installation
+- At least one Grok OAuth JSON credential containing an `access_token` and `refresh_token`
 
 ### Run from source
 
@@ -54,15 +55,15 @@ On Windows PowerShell, use:
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and configure at least one upstream authentication method:
+Create the credential directory and put one OAuth JSON file per account directly inside it:
 
-```dotenv
-# Option 1: provide a SessionToken directly
-GROK_SESSION_TOKEN=your-session-token
-
-# Option 2: read the Grok CLI authentication file
-# GROK_AUTH_FILE=~/.grok/auth.json
+```bash
+mkdir auths
+# auths/account-1.json
+# auths/account-2.json
 ```
+
+`auths` is ignored by Git. The service hot-reloads files and atomically writes refreshed tokens back, so the directory must be writable.
 
 Start the service:
 
@@ -70,7 +71,7 @@ Start the service:
 go run ./cmd/grok2api
 ```
 
-The service listens on `http://0.0.0.0:8088` by default. Open `http://localhost:8088/docs` for interactive API documentation.
+The service listens on `http://0.0.0.0:8088` by default.
 
 ### Run with Docker
 
@@ -79,6 +80,8 @@ Pull the latest image directly from GitHub Container Registry:
 ```bash
 docker pull ghcr.io/futureppo/grokcli2api-go:latest
 docker run --rm -p 8088:8088 --env-file .env \
+  -v "$(pwd)/auths:/auths" \
+  -e GROK_AUTHS_DIR=/auths \
   ghcr.io/futureppo/grokcli2api-go:latest
 ```
 
@@ -86,16 +89,8 @@ Alternatively, build the image locally:
 
 ```bash
 docker build -t grokcli2api-go .
-docker run --rm -p 8088:8088 --env-file .env grokcli2api-go
-```
-
-When using an authentication file, mount it and use its path inside the container:
-
-```bash
-docker run --rm -p 8088:8088 \
-  -v "$HOME/.grok:/home/app/.grok:ro" \
-  -e GROK_AUTH_FILE=/home/app/.grok/auth.json \
-  ghcr.io/futureppo/grokcli2api-go:latest
+docker run --rm -p 8088:8088 --env-file .env \
+  -v "$(pwd)/auths:/auths" -e GROK_AUTHS_DIR=/auths grokcli2api-go
 ```
 
 Every push publishes a `sha-<commit>` tag and a matching branch tag. Pushes to `main` also update `latest`.
@@ -144,7 +139,9 @@ curl http://localhost:8088/v1/messages \
   }'
 ```
 
-If neither `GROK_API_KEYS` nor `GROK_API_KEY` is configured, remove the local API-key header from these examples. Local API keys protect this service; they are separate from the SessionToken sent to the Grok upstream.
+If neither `GROK_API_KEYS` nor `GROK_API_KEY` is configured, remove the local API-key header from these examples. Local API keys protect this service; they are separate from upstream OAuth credentials.
+
+When many users share one local API key, send a stable `X-Grok-Session-ID` per conversation. The service also recognizes `prompt_cache_key`, `previous_response_id`, `user`, and Anthropic `metadata.user_id`; API keys and client IP addresses are never used for affinity.
 
 ## Configuration
 
@@ -160,13 +157,19 @@ The service loads environment variables that are not already set from a `.env` f
 | `GROK_API_KEYS` | empty | Comma-separated local access keys |
 | `GROK_API_KEY` | empty | Backward-compatible alias for one local key |
 
-### Upstream authentication
+### Credential pool and scheduling
 
 | Environment variable | Default | Description |
 | --- | --- | --- |
-| `GROK_SESSION_TOKEN` | empty | Grok SessionToken; takes precedence when set |
-| `GROK_AUTH_FILE` | empty | Path to a Grok CLI authentication JSON file; supports `~` |
-| `GROK_OAUTH_CLIENT_ID` | empty | Reserved; the device OAuth flow is not implemented yet |
+| `GROK_AUTHS_DIR` | `./auths` | Writable, non-recursive OAuth JSON directory |
+| `GROK_AUTHS_RELOAD_INTERVAL` | `30s` | Credential hot-reload interval |
+| `GROK_AUTH_REFRESH_CONCURRENCY` | `4` | Maximum concurrent OAuth refreshes |
+| `GROK_RETRY_MAX_ATTEMPTS` | `3` | Maximum distinct accounts tried per request |
+| `GROK_RETRY_BASE_DELAY` | `200ms` | Base delay for retryable network and 5xx failures |
+| `GROK_RATE_LIMIT_COOLDOWN` | `1m` | 429 cooldown when `Retry-After` is absent |
+| `GROK_QUOTA_COOLDOWN` | `24h` | Cooldown for quota-exhausted accounts |
+| `GROK_AFFINITY_TTL` | `1h` | In-memory session-affinity lifetime |
+| `GROK_AFFINITY_MAX_ENTRIES` | `100000` | Maximum affinity-cache entries |
 
 When local API-key protection is enabled, protected endpoints accept any of these headers:
 
@@ -198,25 +201,20 @@ go run ./cmd/grok2api -version
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/` | Service information |
-| `GET` | `/docs` | Swagger UI |
-| `GET` | `/openapi.json` | OpenAPI 3.1 document |
-| `GET` | `/v1/health` | Upstream health status |
 | `GET` | `/v1/models` | List models |
 | `GET` | `/v1/models/{model_id}` | Get model details |
 | `GET` | `/v1/auth/api-key` | Local API-key protection status |
-| `GET` | `/v1/auth/status` | Upstream authentication status |
-| `POST` | `/v1/auth/refresh` | Reload or refresh upstream authentication |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible Chat Completions |
 | `POST` | `/v1/responses` | OpenAI-compatible Responses |
 | `POST` | `/v1/messages` | Anthropic-compatible Messages |
 
-The service also provides a small set of read-only `/v1/grok/*` passthrough endpoints. See `/openapi.json` for the complete list in the running version.
+The service also provides read-only `/v1/grok/settings`, `user`, `billing`, `mcp/configs`, `mcp/tools/list`, and `feedback/config` passthrough endpoints.
 
 Currently advertised model IDs include `grok-build`, `grok-4`, `grok-4.5`, `grok-auto`, `grok-4-fast-reasoning`, `grok-4-fast-non-reasoning`, `grok-3`, `grok-3-mini`, `grok-code-fast-1`, and `grok-2-vision`. Actual availability depends on the upstream service and account permissions.
 
 ## Security
 
-- Never commit or disclose SessionTokens, API keys, authentication files, or unsanitized logs.
+- Never commit or disclose OAuth tokens, API keys, authentication files, or unsanitized logs.
 - Configure `GROK_API_KEYS` before exposing the service to a network. Use HTTPS, access controls, and rate limiting at the reverse proxy.
 - Do not enable `GROK_TLS_INSECURE_SKIP_VERIFY` outside a controlled debugging environment.
 - Report vulnerabilities privately through [GitHub Security Advisories](https://github.com/Futureppo/grokcli2api-go/security/advisories/new).

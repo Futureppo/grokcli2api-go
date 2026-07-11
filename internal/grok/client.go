@@ -7,18 +7,26 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Futureppo/grokcli2api-go/internal/auth"
 	"github.com/Futureppo/grokcli2api-go/internal/config"
 )
+
+const quotaErrorCode = "personal-team-blocked:spending-limit"
 
 type APIError struct {
 	Status          int
@@ -26,6 +34,7 @@ type APIError struct {
 	RequestID       string
 	UpstreamCode    string
 	UpstreamMessage string
+	RetryAfter      time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -46,15 +55,11 @@ func (e *APIError) Error() string {
 }
 
 type Client struct {
-	cfg       config.Config
-	store     *auth.Store
-	http      *http.Client
-	agentID   string
-	sessionID string
+	cfg  config.Config
+	pool *auth.Pool
+	http *http.Client
 }
 
-// SSEEvent is one complete Server-Sent Event. Data contains the joined data
-// lines (separated by newlines), without the "data:" prefix.
 type SSEEvent struct {
 	Event string
 	Data  []byte
@@ -62,15 +67,18 @@ type SSEEvent struct {
 	Retry string
 }
 
-// EventStream owns an upstream streaming response. Call Close when iteration
-// is stopped before Next reports EOF.
 type EventStream struct {
-	response *http.Response
-	scanner  *bufio.Scanner
-	done     bool
+	response      *http.Response
+	scanner       *bufio.Scanner
+	done          bool
+	pool          *auth.Pool
+	lease         *auth.Lease
+	accountID     string
+	quotaCooldown time.Duration
+	closeOnce     sync.Once
 }
 
-func NewClient(cfg config.Config, store *auth.Store) (*Client, error) {
+func NewHTTPClient(cfg config.Config) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 32
@@ -103,11 +111,30 @@ func NewClient(cfg config.Config, store *auth.Store) (*Client, error) {
 	} else {
 		transport.Proxy = http.ProxyFromEnvironment
 	}
-	return &Client{
-		cfg: cfg, store: store,
-		http:    &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		agentID: NewAgentID(), sessionID: NewSessionID(),
-	}, nil
+	return &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
+}
+
+func NewClient(cfg config.Config, pool *auth.Pool, httpClient *http.Client) (*Client, error) {
+	if cfg.RetryMaxAttempts < 1 {
+		cfg.RetryMaxAttempts = 3
+	}
+	if cfg.RetryBaseDelay <= 0 {
+		cfg.RetryBaseDelay = 200 * time.Millisecond
+	}
+	if cfg.RateLimitCooldown <= 0 {
+		cfg.RateLimitCooldown = time.Minute
+	}
+	if cfg.QuotaCooldown <= 0 {
+		cfg.QuotaCooldown = 24 * time.Hour
+	}
+	if httpClient == nil {
+		var err error
+		httpClient, err = NewHTTPClient(cfg)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &Client{cfg: cfg, pool: pool, http: httpClient}, nil
 }
 
 func splitProxyPatterns(raw string) []string {
@@ -149,34 +176,101 @@ func (c *Client) URL(path string) string {
 	return c.cfg.ChatProxyBaseURL + "/" + c.cfg.ChatProxyVersion + "/" + strings.TrimLeft(path, "/")
 }
 
-func (c *Client) DoJSON(ctx context.Context, method, path string, body map[string]any, convID, model string, trace bool) (map[string]any, error) {
-	var reader io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
+func (c *Client) DoJSON(ctx context.Context, method, path string, body map[string]any, affinity, convID, model string, trace bool) (map[string]any, error) {
+	payload, err := marshalBody(body)
+	if err != nil {
+		return nil, err
+	}
+	used := map[string]struct{}{}
+	refreshed := map[string]bool{}
+	preferredID := ""
+	var lastErr error
+	for len(used) < c.cfg.RetryMaxAttempts {
+		var lease *auth.Lease
+		var err error
+		if preferredID != "" {
+			lease, err = c.pool.AcquireAccount(ctx, preferredID)
+			preferredID = ""
+		} else {
+			lease, err = c.pool.Acquire(ctx, affinity, used)
+		}
 		if err != nil {
+			var unavailable *auth.UnavailableError
+			if errors.As(err, &unavailable) {
+				return nil, err
+			}
+			if lastErr != nil {
+				return nil, lastErr
+			}
 			return nil, err
 		}
-		reader = bytes.NewReader(b)
+		accountID := lease.AccountID()
+		used[accountID] = struct{}{}
+		resp, wrote, err := c.do(ctx, lease, method, path, payload, convID, model, trace, false)
+		if err != nil {
+			lease.Release()
+			lastErr = err
+			if ctx.Err() != nil || wrote || len(used) >= c.cfg.RetryMaxAttempts {
+				return nil, err
+			}
+			if err := c.backoff(ctx, len(used)); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		data, readErr := readResponseBody(resp, 16<<20)
+		resp.Body.Close()
+		if readErr != nil {
+			lease.Release()
+			return nil, readErr
+		}
+		if resp.StatusCode >= 400 {
+			apiErr := parseAPIError(resp, data)
+			lease.Release()
+			lastErr = apiErr
+			if isAuthError(apiErr) && !refreshed[accountID] {
+				refreshed[accountID] = true
+				if refreshErr := c.pool.Refresh(ctx, accountID); refreshErr == nil {
+					delete(used, accountID)
+					preferredID = accountID
+					continue
+				}
+				c.pool.Disable(accountID, "authentication_failed")
+				continue
+			}
+			if isAuthError(apiErr) {
+				c.pool.Disable(accountID, "authentication_failed")
+				if len(used) < c.cfg.RetryMaxAttempts {
+					continue
+				}
+			}
+			if !c.handleRetryable(accountID, apiErr) || len(used) >= c.cfg.RetryMaxAttempts {
+				if strings.EqualFold(apiErr.UpstreamCode, quotaErrorCode) {
+					apiErr.Status = http.StatusTooManyRequests
+					apiErr.UpstreamCode = "account_pool_retry_exhausted"
+					apiErr.UpstreamMessage = "upstream account retry budget exhausted"
+					apiErr.RetryAfter = c.cfg.QuotaCooldown
+				}
+				return nil, apiErr
+			}
+			if apiErr.Status >= 500 {
+				if err := c.backoff(ctx, len(used)); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		lease.Release()
+		return c.decodeSuccess(data, affinity, accountID)
 	}
-	req, err := c.request(ctx, method, path, reader, convID, model, trace)
-	if err != nil {
-		return nil, err
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("upstream request: %w", err)
-	}
-	defer resp.Body.Close()
-	payload, err := readResponseBody(resp, 16<<20)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 400 {
-		return nil, parseAPIError(resp, payload)
-	}
+	return nil, auth.ErrNoAuth
+}
+
+func (c *Client) decodeSuccess(payload []byte, affinity, accountID string) (map[string]any, error) {
+	c.pool.Bind(affinity, accountID)
 	if len(payload) == 0 {
 		return map[string]any{}, nil
 	}
@@ -184,77 +278,204 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 	if err := json.Unmarshal(payload, &out); err != nil {
 		return map[string]any{"raw": string(payload)}, nil
 	}
+	if id := responseID(out); id != "" {
+		c.pool.BindResponseID(id, accountID)
+	}
 	return out, nil
 }
 
-func (c *Client) StreamJSON(ctx context.Context, path string, body map[string]any, convID, model string, trace bool, handle func(map[string]any) error) error {
-	stream, err := c.OpenStream(ctx, path, body, convID, model, trace)
+func (c *Client) OpenStream(ctx context.Context, path string, body map[string]any, affinity, convID, model string, trace bool) (*EventStream, error) {
+	payload, err := marshalBody(body)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer stream.Close()
-	for {
-		event, ok, err := stream.Next()
+	used := map[string]struct{}{}
+	refreshed := map[string]bool{}
+	preferredID := ""
+	var lastErr error
+	for len(used) < c.cfg.RetryMaxAttempts {
+		var lease *auth.Lease
+		var err error
+		if preferredID != "" {
+			lease, err = c.pool.AcquireAccount(ctx, preferredID)
+			preferredID = ""
+		} else {
+			lease, err = c.pool.Acquire(ctx, affinity, used)
+		}
 		if err != nil {
-			return err
+			var unavailable *auth.UnavailableError
+			if errors.As(err, &unavailable) {
+				return nil, err
+			}
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, err
 		}
-		if !ok || string(event.Data) == "[DONE]" {
-			return nil
-		}
-		var chunk map[string]any
-		if json.Unmarshal(event.Data, &chunk) != nil {
+		accountID := lease.AccountID()
+		used[accountID] = struct{}{}
+		resp, wrote, err := c.do(ctx, lease, http.MethodPost, path, payload, convID, model, trace, true)
+		if err != nil {
+			lease.Release()
+			lastErr = err
+			if ctx.Err() != nil || wrote || len(used) >= c.cfg.RetryMaxAttempts {
+				return nil, err
+			}
+			if err := c.backoff(ctx, len(used)); err != nil {
+				return nil, err
+			}
 			continue
 		}
-		if err := handle(chunk); err != nil {
-			return err
+		if resp.StatusCode >= 400 {
+			data, readErr := readResponseBody(resp, 4<<20)
+			resp.Body.Close()
+			lease.Release()
+			if readErr != nil {
+				return nil, readErr
+			}
+			apiErr := parseAPIError(resp, data)
+			lastErr = apiErr
+			if isAuthError(apiErr) && !refreshed[accountID] {
+				refreshed[accountID] = true
+				if c.pool.Refresh(ctx, accountID) == nil {
+					delete(used, accountID)
+					preferredID = accountID
+					continue
+				}
+				c.pool.Disable(accountID, "authentication_failed")
+				used[accountID] = struct{}{}
+				continue
+			}
+			if isAuthError(apiErr) {
+				c.pool.Disable(accountID, "authentication_failed")
+				if len(used) < c.cfg.RetryMaxAttempts {
+					continue
+				}
+			}
+			if !c.handleRetryable(accountID, apiErr) || len(used) >= c.cfg.RetryMaxAttempts {
+				if strings.EqualFold(apiErr.UpstreamCode, quotaErrorCode) {
+					apiErr.Status = http.StatusTooManyRequests
+					apiErr.UpstreamCode = "account_pool_retry_exhausted"
+					apiErr.UpstreamMessage = "upstream account retry budget exhausted"
+					apiErr.RetryAfter = c.cfg.QuotaCooldown
+				}
+				return nil, apiErr
+			}
+			if apiErr.Status >= 500 {
+				if err := c.backoff(ctx, len(used)); err != nil {
+					return nil, err
+				}
+			}
+			continue
 		}
+		c.pool.Bind(affinity, accountID)
+		scanner := bufio.NewScanner(responseReader(resp))
+		scanner.Buffer(make([]byte, 64*1024), 4<<20)
+		return &EventStream{response: resp, scanner: scanner, pool: c.pool, lease: lease, accountID: accountID, quotaCooldown: c.cfg.QuotaCooldown}, nil
 	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, auth.ErrNoAuth
 }
 
-// OpenStream opens and validates the upstream response before the caller
-// commits downstream HTTP headers. This preserves upstream 4xx/5xx statuses
-// for streaming requests.
-func (c *Client) OpenStream(ctx context.Context, path string, body map[string]any, convID, model string, trace bool) (*EventStream, error) {
-	b, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
+func (c *Client) do(ctx context.Context, lease *auth.Lease, method, path string, payload []byte, convID, model string, trace, stream bool) (*http.Response, bool, error) {
+	var wrote atomic.Bool
+	requestCtx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { wrote.Store(true) }})
+	var reader io.Reader
+	if payload != nil {
+		reader = bytes.NewReader(payload)
 	}
-	req, err := c.request(ctx, http.MethodPost, path, bytes.NewReader(b), convID, model, trace)
+	req, err := http.NewRequestWithContext(requestCtx, method, c.URL(path), reader)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	if trace {
-		req.Header.Set("User-Agent", chatUserAgent(c.cfg))
+	req.Header = BuildHeaders(c.cfg, lease.Session(), lease.AgentID(), lease.SessionID(), convID, model, trace)
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+		if trace {
+			req.Header.Set("User-Agent", chatUserAgent(c.cfg))
+		}
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("upstream request: %w", err)
+		return nil, wrote.Load(), fmt.Errorf("upstream request: %w", err)
 	}
-	if resp.StatusCode >= 400 {
-		defer resp.Body.Close()
-		payload, readErr := readResponseBody(resp, 4<<20)
-		if readErr != nil {
-			return nil, readErr
+	return resp, wrote.Load(), nil
+}
+
+func (c *Client) handleRetryable(accountID string, err *APIError) bool {
+	if strings.EqualFold(err.UpstreamCode, quotaErrorCode) {
+		c.pool.MarkCooldown(accountID, "quota_exhausted", c.cfg.QuotaCooldown)
+		return true
+	}
+	if err.Status == http.StatusTooManyRequests {
+		cooldown := err.RetryAfter
+		if cooldown <= 0 {
+			cooldown = c.cfg.RateLimitCooldown
 		}
-		return nil, parseAPIError(resp, payload)
+		if cooldown > 15*time.Minute {
+			cooldown = 15 * time.Minute
+		}
+		c.pool.MarkCooldown(accountID, "rate_limited", cooldown)
+		return true
 	}
-	scanner := bufio.NewScanner(responseReader(resp))
-	scanner.Buffer(make([]byte, 64*1024), 4<<20)
-	return &EventStream{response: resp, scanner: scanner}, nil
+	return err.Status == http.StatusBadGateway || err.Status == http.StatusServiceUnavailable || err.Status == http.StatusGatewayTimeout
+}
+
+func isAuthError(err *APIError) bool {
+	if err.Status == http.StatusUnauthorized {
+		return true
+	}
+	if err.Status != http.StatusForbidden {
+		return false
+	}
+	text := strings.ToLower(err.UpstreamCode + " " + err.UpstreamMessage)
+	return strings.Contains(text, "auth") || strings.Contains(text, "token")
+}
+
+func (c *Client) backoff(ctx context.Context, attempt int) error {
+	delay := c.cfg.RetryBaseDelay
+	if delay <= 0 {
+		delay = 200 * time.Millisecond
+	}
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if delay >= 2*time.Second {
+			delay = 2 * time.Second
+			break
+		}
+	}
+	if delay > time.Millisecond {
+		delay = time.Duration(rand.Int63n(int64(delay))) // #nosec G404: retry jitter is not security-sensitive
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *EventStream) Close() error {
-	if s.response == nil || s.response.Body == nil {
-		return nil
-	}
-	err := s.response.Body.Close()
-	s.response = nil
+	var err error
+	s.closeOnce.Do(func() {
+		if s.response != nil && s.response.Body != nil {
+			err = s.response.Body.Close()
+		}
+		if s.lease != nil {
+			s.lease.Release()
+		}
+		s.response = nil
+	})
 	return err
 }
 
-// Next parses a complete SSE record, including multi-line data fields.
 func (s *EventStream) Next() (SSEEvent, bool, error) {
 	if s.done {
 		return SSEEvent{}, false, nil
@@ -265,6 +486,7 @@ func (s *EventStream) Next() (SSEEvent, bool, error) {
 		line := strings.TrimSuffix(s.scanner.Text(), "\r")
 		if line == "" {
 			if hasField {
+				s.observe(event.Data)
 				return event, true, nil
 			}
 			continue
@@ -279,8 +501,7 @@ func (s *EventStream) Next() (SSEEvent, bool, error) {
 		value = strings.TrimPrefix(value, " ")
 		switch field {
 		case "event":
-			event.Event = value
-			hasField = true
+			event.Event, hasField = value, true
 		case "data":
 			if event.Data != nil {
 				event.Data = append(event.Data, '\n')
@@ -288,38 +509,68 @@ func (s *EventStream) Next() (SSEEvent, bool, error) {
 			event.Data = append(event.Data, value...)
 			hasField = true
 		case "id":
-			event.ID = value
-			hasField = true
+			event.ID, hasField = value, true
 		case "retry":
-			event.Retry = value
-			hasField = true
+			event.Retry, hasField = value, true
 		}
 	}
 	s.done = true
-	if err := s.scanner.Err(); err != nil {
+	err := s.scanner.Err()
+	_ = s.Close()
+	if err != nil {
 		return SSEEvent{}, false, err
 	}
 	if hasField {
+		s.observe(event.Data)
 		return event, true, nil
 	}
 	return SSEEvent{}, false, nil
 }
 
-func (c *Client) request(ctx context.Context, method, path string, body io.Reader, convID, model string, trace bool) (*http.Request, error) {
-	session, err := c.store.Current(ctx)
-	if err != nil {
-		return nil, err
+func (s *EventStream) observe(data []byte) {
+	if len(data) == 0 || string(data) == "[DONE]" {
+		return
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.URL(path), body)
-	if err != nil {
-		return nil, err
+	var payload map[string]any
+	if json.Unmarshal(data, &payload) != nil {
+		return
 	}
-	req.Header = BuildHeaders(c.cfg, session, c.agentID, c.sessionID, convID, model, trace)
-	return req, nil
+	if id := responseID(payload); id != "" {
+		s.pool.BindResponseID(id, s.accountID)
+	}
+	code := stringField(payload, "code")
+	if inner, ok := payload["error"].(map[string]any); ok && code == "" {
+		code = stringField(inner, "code")
+	}
+	if strings.EqualFold(code, quotaErrorCode) {
+		s.pool.MarkCooldown(s.accountID, "quota_exhausted", s.quotaCooldown)
+	}
+}
+
+func responseID(payload map[string]any) string {
+	if id := stringField(payload, "id"); id != "" {
+		return id
+	}
+	if response, ok := payload["response"].(map[string]any); ok {
+		return stringField(response, "id")
+	}
+	return ""
+}
+
+func stringField(payload map[string]any, key string) string {
+	v, _ := payload[key].(string)
+	return v
+}
+
+func marshalBody(body map[string]any) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	return json.Marshal(body)
 }
 
 func parseAPIError(resp *http.Response, body []byte) *APIError {
-	e := &APIError{Status: resp.StatusCode, Body: string(body), RequestID: resp.Header.Get("x-grok-req-id")}
+	e := &APIError{Status: resp.StatusCode, Body: string(body), RequestID: resp.Header.Get("x-grok-req-id"), RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	var parsed map[string]any
 	if json.Unmarshal(body, &parsed) == nil {
 		e.UpstreamCode, _ = parsed["code"].(string)
@@ -337,6 +588,20 @@ func parseAPIError(resp *http.Response, body []byte) *APIError {
 		}
 	}
 	return e
+}
+
+func parseRetryAfter(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(raw); err == nil && when.After(time.Now()) {
+		return time.Until(when)
+	}
+	return 0
 }
 
 func responseReader(resp *http.Response) io.Reader {

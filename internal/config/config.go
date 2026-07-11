@@ -7,30 +7,35 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 type Config struct {
-	Host                    string
-	Port                    int
-	LogLevel                string
-	ChatProxyBaseURL        string
-	ChatProxyVersion        string
-	SessionToken            string
-	AuthFile                string
-	OAuthClientID           string
-	OAuthClientSecret       string
-	ClientName              string
-	ClientVersion           string
-	ClientSurface           string
-	ClientIdentifier        string
-	TokenAuth               string
-	AuthenticateResponseTag string
-	TLSInsecureSkipVerify   bool
-	ProxyURL                string
-	NoProxy                 []string
-	APIKeys                 []string
+	Host                   string
+	Port                   int
+	LogLevel               string
+	ChatProxyBaseURL       string
+	ChatProxyVersion       string
+	AuthsDir               string
+	AuthsReloadInterval    time.Duration
+	AuthRefreshConcurrency int
+	RetryMaxAttempts       int
+	RetryBaseDelay         time.Duration
+	RateLimitCooldown      time.Duration
+	QuotaCooldown          time.Duration
+	AffinityTTL            time.Duration
+	AffinityMaxEntries     int
+	ClientName             string
+	ClientVersion          string
+	ClientSurface          string
+	ClientIdentifier       string
+	TokenAuth              string
+	TLSInsecureSkipVerify  bool
+	ProxyURL               string
+	NoProxy                []string
+	APIKeys                []string
 }
 
 func Load() (Config, error) {
@@ -41,28 +46,88 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	refreshConcurrency, err := envPositiveInt("GROK_AUTH_REFRESH_CONCURRENCY", 4)
+	if err != nil {
+		return Config{}, err
+	}
+	retryAttempts, err := envPositiveInt("GROK_RETRY_MAX_ATTEMPTS", 3)
+	if err != nil {
+		return Config{}, err
+	}
+	affinityMax, err := envPositiveInt("GROK_AFFINITY_MAX_ENTRIES", 100000)
+	if err != nil {
+		return Config{}, err
+	}
+	reloadInterval, err := envDuration("GROK_AUTHS_RELOAD_INTERVAL", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	retryBaseDelay, err := envDuration("GROK_RETRY_BASE_DELAY", 200*time.Millisecond)
+	if err != nil {
+		return Config{}, err
+	}
+	rateLimitCooldown, err := envDuration("GROK_RATE_LIMIT_COOLDOWN", time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	quotaCooldown, err := envDuration("GROK_QUOTA_COOLDOWN", 24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	affinityTTL, err := envDuration("GROK_AFFINITY_TTL", time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
-		Host:                    env("GROK2API_HOST", "0.0.0.0"),
-		Port:                    port,
-		LogLevel:                strings.ToUpper(env("GROK2API_LOG_LEVEL", "INFO")),
-		ChatProxyBaseURL:        strings.TrimRight(env("GROK_CHAT_PROXY_BASE_URL", "https://cli-chat-proxy.grok.com"), "/"),
-		ChatProxyVersion:        strings.Trim(env("GROK_CHAT_PROXY_VERSION", "v1"), "/"),
-		SessionToken:            os.Getenv("GROK_SESSION_TOKEN"),
-		AuthFile:                expandHome(os.Getenv("GROK_AUTH_FILE")),
-		OAuthClientID:           os.Getenv("GROK_OAUTH_CLIENT_ID"),
-		OAuthClientSecret:       os.Getenv("GROK_OAUTH_CLIENT_SECRET"),
-		ClientName:              env("GROK_CLIENT_NAME", "grok-shell"),
-		ClientVersion:           env("GROK_CLIENT_VERSION", "0.2.93"),
-		ClientSurface:           env("GROK_CLIENT_SURFACE", "tui"),
-		ClientIdentifier:        env("GROK_CLIENT_IDENTIFIER", "grok-shell"),
-		TokenAuth:               env("GROK_TOKEN_AUTH", "xai-grok-cli"),
-		AuthenticateResponseTag: env("GROK_AUTHENTICATE_RESPONSE_TAG", "authenticate-response"),
-		TLSInsecureSkipVerify:   envBool("GROK_TLS_INSECURE_SKIP_VERIFY", false),
-		ProxyURL:                strings.TrimSpace(os.Getenv("GROK_PROXY_URL")),
-		NoProxy:                 splitCSV(os.Getenv("GROK_NO_PROXY")),
+		Host:                   env("GROK2API_HOST", "0.0.0.0"),
+		Port:                   port,
+		LogLevel:               strings.ToUpper(env("GROK2API_LOG_LEVEL", "INFO")),
+		ChatProxyBaseURL:       strings.TrimRight(env("GROK_CHAT_PROXY_BASE_URL", "https://cli-chat-proxy.grok.com"), "/"),
+		ChatProxyVersion:       strings.Trim(env("GROK_CHAT_PROXY_VERSION", "v1"), "/"),
+		AuthsDir:               expandHome(env("GROK_AUTHS_DIR", "./auths")),
+		AuthsReloadInterval:    reloadInterval,
+		AuthRefreshConcurrency: refreshConcurrency,
+		RetryMaxAttempts:       retryAttempts,
+		RetryBaseDelay:         retryBaseDelay,
+		RateLimitCooldown:      rateLimitCooldown,
+		QuotaCooldown:          quotaCooldown,
+		AffinityTTL:            affinityTTL,
+		AffinityMaxEntries:     affinityMax,
+		ClientName:             env("GROK_CLIENT_NAME", "grok-shell"),
+		ClientVersion:          env("GROK_CLIENT_VERSION", "0.2.93"),
+		ClientSurface:          env("GROK_CLIENT_SURFACE", "tui"),
+		ClientIdentifier:       env("GROK_CLIENT_IDENTIFIER", "grok-shell"),
+		TokenAuth:              env("GROK_TOKEN_AUTH", "xai-grok-cli"),
+		TLSInsecureSkipVerify:  envBool("GROK_TLS_INSECURE_SKIP_VERIFY", false),
+		ProxyURL:               strings.TrimSpace(os.Getenv("GROK_PROXY_URL")),
+		NoProxy:                splitCSV(os.Getenv("GROK_NO_PROXY")),
 	}
 	cfg.APIKeys = unique(append(splitCSV(os.Getenv("GROK_API_KEYS")), splitCSV(os.Getenv("GROK_API_KEY"))...))
 	return cfg, nil
+}
+
+func envPositiveInt(name string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return n, nil
+}
+
+func envDuration(name string, fallback time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", name)
+	}
+	return d, nil
 }
 
 func (c Config) Address() string { return c.Host + ":" + strconv.Itoa(c.Port) }

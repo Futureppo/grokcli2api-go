@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,34 +23,35 @@ import (
 
 type Server struct {
 	cfg    config.Config
-	store  *auth.Store
+	pool   *auth.Pool
 	client *grok.Client
 	mux    *http.ServeMux
 }
 
 func New(cfg config.Config) (*Server, error) {
-	var provider auth.Provider
-	switch {
-	case cfg.SessionToken != "":
-		provider = auth.FixedProvider{Token: cfg.SessionToken, Surface: cfg.ClientSurface}
-	case cfg.AuthFile != "":
-		provider = auth.FileProvider{Path: cfg.AuthFile, Surface: cfg.ClientSurface}
-	case cfg.OAuthClientID != "":
-		provider = auth.OAuthProvider{}
-	default:
-		provider = auth.NoopProvider{}
-	}
-	store := auth.NewStore(provider)
-	client, err := grok.NewClient(cfg, store)
+	httpClient, err := grok.NewHTTPClient(cfg)
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{cfg: cfg, store: store, client: client, mux: http.NewServeMux()}
+	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: cfg.AuthsDir, Surface: cfg.ClientSurface,
+		ReloadInterval: cfg.AuthsReloadInterval, RefreshConcurrency: cfg.AuthRefreshConcurrency,
+		AffinityTTL: cfg.AffinityTTL, AffinityMaxEntries: cfg.AffinityMaxEntries,
+	}, httpClient)
+	if err != nil {
+		return nil, err
+	}
+	client, err := grok.NewClient(cfg, pool, httpClient)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	s := &Server{cfg: cfg, pool: pool, client: client, mux: http.NewServeMux()}
 	s.routes()
 	return s, nil
 }
 
-func (s *Server) Close() { s.client.Close() }
+func (s *Server) Close() { s.pool.Close(); s.client.Close() }
 
 func (s *Server) Handler() http.Handler {
 	return recoverer(requestLogger(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,16 +60,11 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) routes() {
-	s.mux.HandleFunc("GET /", s.root)
-	s.mux.HandleFunc("GET /docs", s.docs)
-	s.mux.HandleFunc("GET /openapi.json", s.openapi)
-	s.mux.HandleFunc("GET /v1/health", s.health)
+	s.mux.HandleFunc("/", s.root)
 	s.mux.HandleFunc("GET /v1/models", s.models)
 	s.mux.HandleFunc("GET /v1/models/{model_id}", s.model)
 	s.mux.HandleFunc("GET /v1/auth/api-key", s.apiKeyStatus)
 
-	s.protected("POST /v1/auth/refresh", s.authRefresh)
-	s.protected("GET /v1/auth/status", s.authStatus)
 	s.protected("POST /v1/chat/completions", s.chat)
 	s.protected("POST /v1/responses", s.responses)
 	s.protected("POST /v1/messages", s.messages)
@@ -89,9 +87,14 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "grokcli2api-go", "version": config.Version, "docs": "/docs",
-		"openai_compat_endpoints":    []string{"/v1/chat/completions", "/v1/responses", "/v1/models", "/v1/health"},
+		"name": "grokcli2api-go", "version": config.Version,
+		"openai_compat_endpoints":    []string{"/v1/chat/completions", "/v1/responses", "/v1/models"},
 		"anthropic_compat_endpoints": []string{"/v1/messages"},
 	})
 }
@@ -113,42 +116,6 @@ func (s *Server) apiKeyStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"enabled": len(s.cfg.APIKeys) > 0, "key_count": len(s.cfg.APIKeys)})
 }
 
-func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	payload, err := s.client.DoJSON(r.Context(), http.MethodGet, "models", nil, "", "", false)
-	if err == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "upstream": payload})
-		return
-	}
-	if errors.Is(err, auth.ErrNoAuth) || strings.Contains(err.Error(), "no auth configured") {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "no_auth"})
-		return
-	}
-	var upstream *grok.APIError
-	if errors.As(err, &upstream) {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "degraded", "upstream_status": upstream.Status})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "degraded", "error": err.Error()})
-}
-
-func (s *Server) authRefresh(w http.ResponseWriter, r *http.Request) {
-	session, err := s.store.ForceRefresh(r.Context())
-	if err != nil {
-		writeAuthError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, session)
-}
-
-func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
-	session, err := s.store.Current(r.Context())
-	if err != nil {
-		writeAuthError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"surface": session.Surface, "user_id": session.UserID, "expired": session.Expired(), "expires_at": session.ExpiresAt})
-}
-
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	body, ok := decodeRequest(w, r)
 	if !ok {
@@ -160,9 +127,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	wire := openai.PrepareChat(body)
 	model := openai.String(body, "model", "grok-build")
-	convID := openai.String(body, "user", grok.NewID())
+	affinity := requestAffinity(r, body)
+	convID := conversationID(affinity)
 	if !openai.IsStreaming(body) {
-		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "chat/completions", wire, convID, model, false)
+		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "chat/completions", wire, affinity, convID, model, false)
 		if err != nil {
 			s.writeClientError(w, err)
 			return
@@ -170,7 +138,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, openai.Normalize(payload, model, false))
 		return
 	}
-	s.streamChat(w, r, wire, convID, model)
+	s.streamChat(w, r, wire, affinity, convID, model)
 }
 
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
@@ -188,9 +156,10 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		wire = openai.PrepareNativeResponses(body)
 	}
 	model := openai.String(body, "model", "grok-build")
-	convID := openai.String(body, "user", grok.NewID())
+	affinity := requestAffinity(r, body)
+	convID := conversationID(affinity)
 	if !openai.IsStreaming(body) {
-		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "responses", wire, convID, fmt.Sprint(wire["model"]), true)
+		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 		if err != nil {
 			s.writeClientError(w, err)
 			return
@@ -202,7 +171,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	s.streamResponses(w, r, wire, convID, model, native)
+	s.streamResponses(w, r, wire, affinity, convID, model, native)
 }
 
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
@@ -224,9 +193,10 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("anthropic compatibility field stripped", "field", field, "path", r.URL.Path)
 	}
 	model := openai.String(body, "model", "grok-build")
-	convID := openai.String(prepared.Body, "user", grok.NewID())
+	affinity := requestAffinity(r, body)
+	convID := conversationID(affinity)
 	if !openai.IsStreaming(body) {
-		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "responses", prepared.Body, convID, fmt.Sprint(prepared.Body["model"]), true)
+		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "responses", prepared.Body, affinity, convID, fmt.Sprint(prepared.Body["model"]), true)
 		if err != nil {
 			s.writeAnthropicClientError(w, err)
 			return
@@ -234,11 +204,11 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, anthropic.NormalizeResponse(payload, model))
 		return
 	}
-	s.streamAnthropic(w, r, prepared.Body, convID, model)
+	s.streamAnthropic(w, r, prepared.Body, affinity, convID, model)
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[string]any, convID, model string) {
-	stream, err := s.client.OpenStream(r.Context(), "chat/completions", wire, convID, fmt.Sprint(wire["model"]), false)
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity, convID, model string) {
+	stream, err := s.client.OpenStream(r.Context(), "chat/completions", wire, affinity, convID, fmt.Sprint(wire["model"]), false)
 	if err != nil {
 		s.writeClientError(w, err)
 		return
@@ -282,8 +252,8 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[str
 	flush()
 }
 
-func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire map[string]any, convID, model string, native bool) {
-	stream, err := s.client.OpenStream(r.Context(), "responses", wire, convID, fmt.Sprint(wire["model"]), true)
+func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity, convID, model string, native bool) {
+	stream, err := s.client.OpenStream(r.Context(), "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 	if err != nil {
 		s.writeClientError(w, err)
 		return
@@ -320,8 +290,8 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 	}
 }
 
-func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, wire map[string]any, convID, model string) {
-	stream, err := s.client.OpenStream(r.Context(), "responses", wire, convID, fmt.Sprint(wire["model"]), true)
+func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity, convID, model string) {
+	stream, err := s.client.OpenStream(r.Context(), "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 	if err != nil {
 		s.writeAnthropicClientError(w, err)
 		return
@@ -363,7 +333,8 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, wire ma
 
 func (s *Server) proxyGET(path string, trace bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		payload, err := s.client.DoJSON(r.Context(), http.MethodGet, path, nil, "", "", trace)
+		affinity := requestAffinity(r, nil)
+		payload, err := s.client.DoJSON(r.Context(), http.MethodGet, path, nil, affinity, conversationID(affinity), "", trace)
 		if err != nil {
 			s.writeClientError(w, err)
 			return
@@ -403,29 +374,41 @@ func (s *Server) apiKeyGate(next http.Handler) http.Handler {
 }
 
 func (s *Server) writeClientError(w http.ResponseWriter, err error) {
+	var unavailable *auth.UnavailableError
+	if errors.As(err, &unavailable) {
+		writeUnavailable(w, unavailable, false)
+		return
+	}
 	var upstream *grok.APIError
 	if errors.As(err, &upstream) {
 		status := upstream.Status
 		if status < 400 || status > 599 {
 			status = http.StatusBadGateway
 		}
+		setRetryAfter(w, upstream.RetryAfter)
 		writeJSON(w, status, upstreamError(upstream))
 		return
 	}
-	if errors.Is(err, auth.ErrNoAuth) || strings.Contains(err.Error(), "auth") {
-		writeAuthError(w, err)
+	if errors.Is(err, auth.ErrNoAuth) {
+		writeError(w, http.StatusServiceUnavailable, "no usable upstream accounts", "upstream_error", "503")
 		return
 	}
 	writeError(w, http.StatusBadGateway, err.Error(), "upstream_error", "502")
 }
 
 func (s *Server) writeAnthropicClientError(w http.ResponseWriter, err error) {
+	var unavailable *auth.UnavailableError
+	if errors.As(err, &unavailable) {
+		writeUnavailable(w, unavailable, true)
+		return
+	}
 	var upstream *grok.APIError
 	if errors.As(err, &upstream) {
 		status := upstream.Status
 		if status < 400 || status > 599 {
 			status = http.StatusBadGateway
 		}
+		setRetryAfter(w, upstream.RetryAfter)
 		kind := anthropicErrorType(status)
 		message := upstream.UpstreamMessage
 		if message == "" {
@@ -434,28 +417,39 @@ func (s *Server) writeAnthropicClientError(w http.ResponseWriter, err error) {
 		writeAnthropicError(w, status, message, kind)
 		return
 	}
-	if errors.Is(err, auth.ErrNoAuth) || strings.Contains(strings.ToLower(err.Error()), "auth") {
-		writeAnthropicError(w, http.StatusUnauthorized, err.Error(), "authentication_error")
+	if errors.Is(err, auth.ErrNoAuth) {
+		writeAnthropicError(w, http.StatusServiceUnavailable, "no usable upstream accounts", "api_error")
 		return
 	}
 	writeAnthropicError(w, http.StatusBadGateway, err.Error(), "api_error")
 }
 
 func clientErrorPayload(err error) map[string]any {
+	var unavailable *auth.UnavailableError
+	if errors.As(err, &unavailable) {
+		if unavailable.Cooling {
+			return openai.Error("all upstream accounts are cooling down", "rate_limit_error", "429")
+		}
+		return openai.Error("no usable upstream accounts", "upstream_error", "503")
+	}
 	var upstream *grok.APIError
 	if errors.As(err, &upstream) {
 		return upstreamError(upstream)
 	}
 	typeName, code := "upstream_error", "502"
-	if errors.Is(err, auth.ErrNoAuth) || strings.Contains(err.Error(), "auth") {
-		typeName, code = "auth_error", "401"
+	if errors.Is(err, auth.ErrNoAuth) {
+		typeName, code = "upstream_error", "503"
 	}
 	return openai.Error(err.Error(), typeName, code)
 }
 
 func upstreamError(e *grok.APIError) map[string]any {
 	kind := "invalid_request_error"
-	if e.Status >= 500 {
+	if e.Status == http.StatusTooManyRequests {
+		kind = "rate_limit_error"
+	} else if e.Status == http.StatusUnauthorized || e.Status == http.StatusForbidden {
+		kind = "authentication_error"
+	} else if e.Status >= 500 {
 		kind = "upstream_error"
 	}
 	code := e.UpstreamCode
@@ -503,11 +497,39 @@ func decodeAnthropicRequest(w http.ResponseWriter, r *http.Request) (map[string]
 	return body, true
 }
 
-func writeAuthError(w http.ResponseWriter, err error) {
-	writeError(w, http.StatusUnauthorized, err.Error(), "auth_error", "401")
-}
 func writeError(w http.ResponseWriter, status int, message, kind, code string) {
 	writeJSON(w, status, openai.Error(message, kind, code))
+}
+
+func writeUnavailable(w http.ResponseWriter, unavailable *auth.UnavailableError, anthropicResponse bool) {
+	status, message := http.StatusServiceUnavailable, "no usable upstream accounts"
+	kind := "upstream_error"
+	if unavailable.Cooling {
+		status, message, kind = http.StatusTooManyRequests, "all upstream accounts are cooling down", "rate_limit_error"
+		if unavailable.RetryAfter > 0 {
+			seconds := int64(unavailable.RetryAfter.Round(time.Second) / time.Second)
+			if seconds < 1 {
+				seconds = 1
+			}
+			w.Header().Set("Retry-After", fmt.Sprint(seconds))
+		}
+	}
+	if anthropicResponse {
+		writeAnthropicError(w, status, message, anthropicErrorType(status))
+		return
+	}
+	writeError(w, status, message, kind, fmt.Sprint(status))
+}
+
+func setRetryAfter(w http.ResponseWriter, delay time.Duration) {
+	if delay <= 0 {
+		return
+	}
+	seconds := int64(delay.Round(time.Second) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", fmt.Sprint(seconds))
 }
 func writeAnthropicError(w http.ResponseWriter, status int, message, kind string) {
 	writeJSON(w, status, anthropic.Error(message, kind))
@@ -604,6 +626,35 @@ func isGrokBuildClient(r *http.Request) bool {
 	}
 	return false
 }
+
+func requestAffinity(r *http.Request, body map[string]any) string {
+	if value := strings.TrimSpace(r.Header.Get("X-Grok-Session-ID")); value != "" {
+		return "session:" + value
+	}
+	if value := openai.String(body, "prompt_cache_key", ""); value != "" {
+		return "cache:" + value
+	}
+	if value := openai.String(body, "previous_response_id", ""); value != "" {
+		return "previous:" + value
+	}
+	if value := openai.String(body, "user", ""); value != "" {
+		return "user:" + value
+	}
+	if metadata, ok := body["metadata"].(map[string]any); ok {
+		if value := openai.String(metadata, "user_id", ""); value != "" {
+			return "user:" + value
+		}
+	}
+	return ""
+}
+
+func conversationID(affinity string) string {
+	if affinity == "" {
+		return grok.NewID()
+	}
+	sum := sha256.Sum256([]byte(affinity))
+	return hex.EncodeToString(sum[:16])
+}
 func constantEqual(a, b string) int {
 	if len(a) != len(b) {
 		return 0
@@ -628,22 +679,4 @@ func recoverer(next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(w, r)
 	})
-}
-
-func (s *Server) docs(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, `<!doctype html><html><head><title>grokcli2api-go</title><link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"></head><body><div id="swagger-ui"></div><script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script><script>SwaggerUIBundle({url:'/openapi.json',dom_id:'#swagger-ui'})</script></body></html>`)
-}
-
-func (s *Server) openapi(w http.ResponseWriter, _ *http.Request) {
-	paths := map[string]any{}
-	for _, entry := range []struct{ path, method, summary string }{
-		{"/v1/health", "get", "Health probe"}, {"/v1/models", "get", "List models"},
-		{"/v1/chat/completions", "post", "Create chat completion"}, {"/v1/responses", "post", "Create response"},
-		{"/v1/messages", "post", "Create Anthropic-compatible message"},
-		{"/v1/auth/status", "get", "Authentication status"}, {"/v1/auth/refresh", "post", "Refresh authentication"},
-	} {
-		paths[entry.path] = map[string]any{entry.method: map[string]any{"summary": entry.summary, "responses": map[string]any{"200": map[string]any{"description": "Success"}}}}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"openapi": "3.1.0", "info": map[string]any{"title": "grokcli2api-go", "version": config.Version}, "paths": paths})
 }

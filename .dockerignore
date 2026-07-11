@@ -1,6 +1,7 @@
 .git
 .github
 .env
+auths
 dist
 tests
 coverage.out

@@ -16,10 +16,11 @@
 - 支持 OpenAI Responses API
 - 支持 Anthropic Messages API
 - 支持流式与非流式响应
-- 支持 Grok CLI SessionToken 和本地认证文件
+- 支持多账号 OAuth 凭证池、自动刷新和目录热加载
+- 支持会话亲和、账号轮询、自动重试和额度冷却
 - 可配置本地 API Key 访问保护
 - 支持 HTTP、HTTPS、SOCKS5 和 SOCKS5H 出站代理
-- 内置健康检查、模型列表、OpenAPI 文档和 Swagger UI
+- 内置模型列表和 Grok 只读透传接口
 - 仅使用 Go 标准库，便于构建和部署
 
 ## API 兼容性
@@ -38,7 +39,7 @@
 ### 前置条件
 
 - Go 1.23 或更高版本
-- 一个有效的 Grok CLI SessionToken，或已登录 Grok CLI 生成的认证文件
+- 至少一个包含 OAuth `access_token` 与 `refresh_token` 的 Grok 凭证 JSON
 
 ### 从源码运行
 
@@ -54,15 +55,15 @@ Windows PowerShell 可使用：
 Copy-Item .env.example .env
 ```
 
-编辑 `.env`，至少配置一种上游认证方式：
+创建凭证目录，将每个账号的 OAuth JSON 直接放入其中：
 
-```dotenv
-# 方式一：直接使用 SessionToken
-GROK_SESSION_TOKEN=your-session-token
-
-# 方式二：读取 Grok CLI 的认证文件
-# GROK_AUTH_FILE=~/.grok/auth.json
+```bash
+mkdir auths
+# auths/account-1.json
+# auths/account-2.json
 ```
+
+`auths` 已被 Git 忽略。服务会热加载文件并原子写回刷新的 token，因此目录必须可写。
 
 启动服务：
 
@@ -70,7 +71,7 @@ GROK_SESSION_TOKEN=your-session-token
 go run ./cmd/grok2api
 ```
 
-服务默认监听 `http://0.0.0.0:8088`。打开 `http://localhost:8088/docs` 可查看交互式 API 文档。
+服务默认监听 `http://0.0.0.0:8088`。
 
 ### 使用 Docker
 
@@ -79,6 +80,8 @@ go run ./cmd/grok2api
 ```bash
 docker pull ghcr.io/futureppo/grokcli2api-go:latest
 docker run --rm -p 8088:8088 --env-file .env \
+  -v "$(pwd)/auths:/auths" \
+  -e GROK_AUTHS_DIR=/auths \
   ghcr.io/futureppo/grokcli2api-go:latest
 ```
 
@@ -86,16 +89,8 @@ docker run --rm -p 8088:8088 --env-file .env \
 
 ```bash
 docker build -t grokcli2api-go .
-docker run --rm -p 8088:8088 --env-file .env grokcli2api-go
-```
-
-如果使用认证文件，需要将文件挂载到容器并使用容器内路径：
-
-```bash
-docker run --rm -p 8088:8088 \
-  -v "$HOME/.grok:/home/app/.grok:ro" \
-  -e GROK_AUTH_FILE=/home/app/.grok/auth.json \
-  ghcr.io/futureppo/grokcli2api-go:latest
+docker run --rm -p 8088:8088 --env-file .env \
+  -v "$(pwd)/auths:/auths" -e GROK_AUTHS_DIR=/auths grokcli2api-go
 ```
 
 每次推送都会发布 `sha-<commit>` 和对应的分支标签；`main` 分支还会更新 `latest` 标签。
@@ -144,7 +139,9 @@ curl http://localhost:8088/v1/messages \
   }'
 ```
 
-如果没有设置 `GROK_API_KEYS` 或 `GROK_API_KEY`，请从示例中移除本地 API Key 请求头。它们只用于保护本服务，不是发送给 Grok 上游的 SessionToken。
+如果没有设置 `GROK_API_KEYS` 或 `GROK_API_KEY`，请从示例中移除本地 API Key 请求头。它们只用于保护本服务，不是上游 OAuth 凭证。
+
+并发共享同一个本地 API Key 时，可通过 `X-Grok-Session-ID` 为每个会话提供稳定标识。服务也会自动识别 `prompt_cache_key`、`previous_response_id`、`user` 和 Anthropic `metadata.user_id`，不会使用 API Key 或客户端 IP 做账号亲和。
 
 ## 配置
 
@@ -160,13 +157,19 @@ curl http://localhost:8088/v1/messages \
 | `GROK_API_KEYS` | 空 | 逗号分隔的本地访问密钥 |
 | `GROK_API_KEY` | 空 | 单个本地访问密钥的兼容别名 |
 
-### 上游认证
+### 凭证池与调度
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `GROK_SESSION_TOKEN` | 空 | 直接提供 Grok SessionToken，优先级最高 |
-| `GROK_AUTH_FILE` | 空 | Grok CLI 认证 JSON 文件路径，支持 `~` |
-| `GROK_OAUTH_CLIENT_ID` | 空 | 预留配置；设备 OAuth 流程目前尚未实现 |
+| `GROK_AUTHS_DIR` | `./auths` | 非递归扫描的可写 OAuth JSON 目录 |
+| `GROK_AUTHS_RELOAD_INTERVAL` | `30s` | 凭证目录热加载周期 |
+| `GROK_AUTH_REFRESH_CONCURRENCY` | `4` | OAuth 刷新并发数 |
+| `GROK_RETRY_MAX_ATTEMPTS` | `3` | 单个请求最多尝试的不同账号数 |
+| `GROK_RETRY_BASE_DELAY` | `200ms` | 可重试网络与 5xx 错误的基础退避 |
+| `GROK_RATE_LIMIT_COOLDOWN` | `1m` | 无 `Retry-After` 时的 429 冷却时间 |
+| `GROK_QUOTA_COOLDOWN` | `24h` | 额度耗尽账号的冷却时间 |
+| `GROK_AFFINITY_TTL` | `1h` | 内存会话亲和有效期 |
+| `GROK_AFFINITY_MAX_ENTRIES` | `100000` | 会话亲和缓存容量上限 |
 
 设置本地 API Key 后，受保护接口接受以下任一种请求头：
 
@@ -198,25 +201,20 @@ go run ./cmd/grok2api -version
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/` | 服务信息 |
-| `GET` | `/docs` | Swagger UI |
-| `GET` | `/openapi.json` | OpenAPI 3.1 文档 |
-| `GET` | `/v1/health` | 上游健康状态 |
 | `GET` | `/v1/models` | 模型列表 |
 | `GET` | `/v1/models/{model_id}` | 模型详情 |
 | `GET` | `/v1/auth/api-key` | 本地 API Key 保护状态 |
-| `GET` | `/v1/auth/status` | 上游认证状态 |
-| `POST` | `/v1/auth/refresh` | 重新读取或刷新上游认证 |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions 兼容接口 |
 | `POST` | `/v1/responses` | OpenAI Responses 兼容接口 |
 | `POST` | `/v1/messages` | Anthropic Messages 兼容接口 |
 
-服务还提供少量 `/v1/grok/*` 只读透传接口。请通过 `/openapi.json` 查看当前版本的完整列表。
+服务还提供 `/v1/grok/settings`、`user`、`billing`、`mcp/configs`、`mcp/tools/list` 和 `feedback/config` 只读透传接口。
 
 当前公开的模型标识包括 `grok-build`、`grok-4`、`grok-4.5`、`grok-auto`、`grok-4-fast-reasoning`、`grok-4-fast-non-reasoning`、`grok-3`、`grok-3-mini`、`grok-code-fast-1` 和 `grok-2-vision`。实际可用性取决于上游服务和账号权限。
 
 ## 安全建议
 
-- 不要提交或公开 SessionToken、API Key、认证文件及未脱敏日志。
+- 不要提交或公开 OAuth token、API Key、认证文件及未脱敏日志。
 - 对外网提供服务前务必设置 `GROK_API_KEYS`，并在反向代理层启用 HTTPS、访问控制和限流。
 - 除非处于受控调试环境，否则不要启用 `GROK_TLS_INSECURE_SKIP_VERIFY`。
 - 安全漏洞请通过 [GitHub Security Advisories](https://github.com/Futureppo/grokcli2api-go/security/advisories/new) 私下报告。

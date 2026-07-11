@@ -2,11 +2,17 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Futureppo/grokcli2api-go/internal/config"
 )
@@ -54,6 +60,100 @@ func TestAPIKeyGateAndChatProxy(t *testing.T) {
 	}
 }
 
+func TestQuotaErrorSwitchesAccount(t *testing.T) {
+	var mu sync.Mutex
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		tokens = append(tokens, token)
+		call := len(tokens)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"code":"personal-team-blocked:spending-limit","error":"quota exhausted"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-ok","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a", "token-b"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}],"user":"session-a"}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tokens) != 2 || tokens[0] == tokens[1] {
+		t.Fatalf("expected two different accounts, got %v", tokens)
+	}
+}
+
+func TestServiceUnavailableRetriesDifferentAccount(t *testing.T) {
+	var mu sync.Mutex
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		tokens = append(tokens, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		call := len(tokens)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":"temporarily unavailable"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-ok","choices":[]}`)
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a", "token-b"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tokens) != 2 || tokens[0] == tokens[1] {
+		t.Fatalf("expected retry on a different account, got %v", tokens)
+	}
+}
+
+func TestSessionAffinityDoesNotUseLocalAPIKey(t *testing.T) {
+	var mu sync.Mutex
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		tokens = append(tokens, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-ok","choices":[]}`)
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, []string{"shared-key"}, []string{"token-a", "token-b"})
+	request := func(session string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer shared-key")
+		req.Header.Set("X-Grok-Session-ID", session)
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("session %s status=%d body=%s", session, rec.Code, rec.Body.String())
+		}
+	}
+	request("one")
+	request("one")
+	request("two")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tokens) != 3 || tokens[0] != tokens[1] || tokens[2] == tokens[0] {
+		t.Fatalf("unexpected affinity assignments: %v", tokens)
+	}
+}
+
 func TestStreamingSSE(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -67,6 +167,34 @@ func TestStreamingSSE(t *testing.T) {
 	text := rec.Body.String()
 	if rec.Code != 200 || !strings.Contains(text, `"role":"assistant"`) || !strings.Contains(text, `"content":"hi"`) || !strings.HasSuffix(text, "data: [DONE]\n\n") {
 		t.Fatalf("invalid SSE response (%d): %s", rec.Code, text)
+	}
+}
+
+func TestStreamingFailureAfterHeadersIsNotRetried(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("response writer does not support hijacking")
+			return
+		}
+		conn, writer, err := hijacker.Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_, _ = writer.WriteString("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 512\r\n\r\ndata: {\"choices\":[]}\n\n")
+		_ = writer.Flush()
+		_ = conn.Close()
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a", "token-b"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || calls.Load() != 1 {
+		t.Fatalf("status=%d upstream_calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
 	}
 }
 
@@ -239,12 +367,28 @@ func TestStreamingUpstreamErrorKeepsHTTPStatus(t *testing.T) {
 
 func TestPublicRoutesBypassGate(t *testing.T) {
 	h := newTestHandler(t, "http://127.0.0.1:1", []string{"key"})
-	for _, path := range []string{"/v1/models", "/v1/auth/api-key", "/openapi.json"} {
+	for _, path := range []string{"/v1/models", "/v1/auth/api-key"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != 200 {
 			t.Errorf("%s status = %d", path, rec.Code)
 		}
+	}
+}
+
+func TestRemovedRoutesAre404(t *testing.T) {
+	h := newTestHandler(t, "http://127.0.0.1:1", nil)
+	for _, path := range []string{"/docs", "/openapi.json", "/v1/health", "/v1/auth/status"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s status = %d", path, rec.Code)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/auth/refresh", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("/v1/auth/refresh status = %d", rec.Code)
 	}
 }
 
@@ -254,6 +398,30 @@ func TestUnknownRouteIs404(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/does-not-exist", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestAffinityInputPrecedenceAndOpaqueConversationID(t *testing.T) {
+	body := map[string]any{
+		"prompt_cache_key": "cache", "previous_response_id": "resp", "user": "user",
+		"metadata": map[string]any{"user_id": "metadata-user"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("X-Grok-Session-ID", "secret-session")
+	if got := requestAffinity(req, body); got != "session:secret-session" {
+		t.Fatalf("header affinity = %q", got)
+	}
+	conv := conversationID(requestAffinity(req, body))
+	if conv == "" || strings.Contains(conv, "secret-session") || conv != conversationID("session:secret-session") {
+		t.Fatalf("conversation id is not stable and opaque: %q", conv)
+	}
+	req.Header.Del("X-Grok-Session-ID")
+	if got := requestAffinity(req, body); got != "cache:cache" {
+		t.Fatalf("prompt cache affinity = %q", got)
+	}
+	delete(body, "prompt_cache_key")
+	if got := requestAffinity(req, body); got != "previous:resp" {
+		t.Fatalf("previous response affinity = %q", got)
 	}
 }
 
@@ -271,8 +439,16 @@ func BenchmarkModelsEndpoint(b *testing.B) {
 }
 
 func newTestHandler(t *testing.T, upstream string, keys []string) http.Handler {
+	return newTestHandlerWithTokens(t, upstream, keys, []string{"upstream-token"})
+}
+
+func newTestHandlerWithTokens(t *testing.T, upstream string, keys, tokens []string) http.Handler {
 	t.Helper()
-	cfg := config.Config{ChatProxyBaseURL: upstream, ChatProxyVersion: "v1", SessionToken: "upstream-token", ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli", APIKeys: keys}
+	dir := t.TempDir()
+	for i, token := range tokens {
+		writeCredentialFile(t, dir, fmt.Sprintf("test-%d", i), token)
+	}
+	cfg := config.Config{ChatProxyBaseURL: upstream, ChatProxyVersion: "v1", AuthsDir: dir, AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, AffinityTTL: time.Hour, AffinityMaxEntries: 1024, RetryMaxAttempts: 3, RetryBaseDelay: time.Millisecond, RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour, ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli", APIKeys: keys}
 	s, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -283,11 +459,35 @@ func newTestHandler(t *testing.T, upstream string, keys []string) http.Handler {
 
 func newBenchmarkHandler(b *testing.B) http.Handler {
 	b.Helper()
-	cfg := config.Config{ChatProxyBaseURL: "http://127.0.0.1:1", ChatProxyVersion: "v1", SessionToken: "token", ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli"}
+	dir := b.TempDir()
+	writeBenchmarkCredential(b, dir, "token")
+	cfg := config.Config{ChatProxyBaseURL: "http://127.0.0.1:1", ChatProxyVersion: "v1", AuthsDir: dir, AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, AffinityTTL: time.Hour, AffinityMaxEntries: 1024, RetryMaxAttempts: 3, RetryBaseDelay: time.Millisecond, RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour, ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli"}
 	s, err := New(cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(s.Close)
 	return s.Handler()
+}
+
+func writeBenchmarkCredential(b *testing.B, dir, token string) {
+	b.Helper()
+	writeCredentialFile(b, dir, "test", token)
+}
+
+type fatalHelper interface {
+	Helper()
+	Fatal(...any)
+}
+
+func writeCredentialFile(tb fatalHelper, dir, subject, token string) {
+	tb.Helper()
+	raw := map[string]any{"access_token": token, "refresh_token": "refresh", "client_id": "client", "sub": subject, "expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, subject+".json"), b, 0o600); err != nil {
+		tb.Fatal(err)
+	}
 }

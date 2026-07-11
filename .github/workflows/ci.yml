@@ -26,12 +26,16 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Test
         run: go test ./...
+      - name: Race detector
+        if: runner.os == 'Linux'
+        run: go test -race ./...
       - name: Vet
         run: go vet ./...
       - name: Build
         run: go build ./cmd/grok2api
 
   docker:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
