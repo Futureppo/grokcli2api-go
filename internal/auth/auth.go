@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -48,16 +49,18 @@ func (e *RefreshError) Error() string {
 }
 
 type credential struct {
-	Path         string
-	Raw          map[string]any
-	AccessToken  string
-	RefreshToken string
-	TokenURL     string
-	ClientID     string
-	Subject      string
-	Surface      string
-	ExpiresAt    time.Time
-	ExpiresIn    time.Duration
+	Path            string
+	Raw             map[string]any
+	AccessToken     string
+	RefreshToken    string
+	TokenURL        string
+	ClientID        string
+	Subject         string
+	Surface         string
+	ExpiresAt       time.Time
+	ExpiresIn       time.Duration
+	Models          []string
+	ModelsUpdatedAt time.Time
 }
 
 func loadCredential(path, surface string) (*credential, error) {
@@ -109,6 +112,7 @@ func loadCredential(path, surface string) (*credential, error) {
 		TokenURL: firstNonEmpty(firstString(node, "token_endpoint"), "https://auth.x.ai/oauth2/token"),
 		ClientID: clientID, Subject: subject, Surface: defaultSurface(surface),
 		ExpiresAt: expiresAt, ExpiresIn: expiresIn,
+		Models: stringSlice(node["models"]), ModelsUpdatedAt: firstTime(node, "models_updated_at"),
 	}, nil
 }
 
@@ -398,6 +402,35 @@ func number(value any) int64 {
 		return n
 	}
 	return 0
+}
+
+func stringSlice(value any) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	switch values := value.(type) {
+	case []any:
+		for _, item := range values {
+			if model, ok := item.(string); ok && strings.TrimSpace(model) != "" {
+				model = strings.TrimSpace(model)
+				if _, duplicate := seen[model]; !duplicate {
+					seen[model] = struct{}{}
+					out = append(out, model)
+				}
+			}
+		}
+	case []string:
+		for _, model := range values {
+			model = strings.TrimSpace(model)
+			if model != "" {
+				if _, duplicate := seen[model]; !duplicate {
+					seen[model] = struct{}{}
+					out = append(out, model)
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func cloneMap(raw map[string]any) map[string]any {

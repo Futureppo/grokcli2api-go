@@ -34,6 +34,12 @@ type UnavailableError struct {
 	RetryAfter time.Duration
 }
 
+type ModelUnavailableError struct{ Model string }
+
+func (e *ModelUnavailableError) Error() string {
+	return "no credential account advertises model " + e.Model
+}
+
 func (e *UnavailableError) Error() string {
 	if e.Cooling {
 		return "all credential accounts are cooling down"
@@ -62,6 +68,19 @@ func (a *account) available(now time.Time) bool {
 	return !a.disabled && !now.Before(a.cooldownUntil) && a.credential != nil
 }
 
+func (a *account) supportsModel(model string) bool {
+	if model == "" {
+		return true
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.disabled || a.credential == nil {
+		return false
+	}
+	index := sort.SearchStrings(a.credential.Models, model)
+	return index < len(a.credential.Models) && a.credential.Models[index] == model
+}
+
 func (a *account) snapshot() (*credential, time.Time, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -86,20 +105,21 @@ type accountState struct {
 }
 
 type Pool struct {
-	cfg        PoolConfig
-	http       *http.Client
-	mu         sync.RWMutex
-	accounts   map[string]*account
-	files      map[string]fileEntry
-	states     map[string]accountState
-	active     atomic.Value // []*account
-	cursor     atomic.Uint64
-	affinity   *affinityCache
-	refreshSem chan struct{}
-	rebuildCh  chan struct{}
-	closed     chan struct{}
-	closeOnce  sync.Once
-	wg         sync.WaitGroup
+	cfg           PoolConfig
+	http          *http.Client
+	mu            sync.RWMutex
+	accounts      map[string]*account
+	files         map[string]fileEntry
+	states        map[string]accountState
+	active        atomic.Value // []*account
+	activeByModel atomic.Value // map[string][]*account
+	cursor        atomic.Uint64
+	affinity      *affinityCache
+	refreshSem    chan struct{}
+	rebuildCh     chan struct{}
+	closed        chan struct{}
+	closeOnce     sync.Once
+	wg            sync.WaitGroup
 }
 
 type Lease struct {
@@ -150,6 +170,7 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 		refreshSem: make(chan struct{}, cfg.RefreshConcurrency), rebuildCh: make(chan struct{}, 1), closed: make(chan struct{}),
 	}
 	p.active.Store([]*account{})
+	p.activeByModel.Store(map[string][]*account{})
 	_ = p.loadState()
 	if err := p.scan(); err != nil {
 		return nil, err
@@ -179,27 +200,31 @@ func (p *Pool) Close() {
 	})
 }
 
-func (p *Pool) Acquire(ctx context.Context, affinity string, exclude map[string]struct{}) (*Lease, error) {
+func (p *Pool) Acquire(ctx context.Context, affinity, model string, exclude map[string]struct{}) (*Lease, error) {
+	cacheKey := modelAffinityKey(affinity, model)
 	if affinity != "" {
-		if id, ok := p.affinity.Get(affinity); ok {
-			if lease, err := p.acquireID(ctx, id, exclude); err == nil {
+		if id, ok := p.affinity.Get(cacheKey); ok {
+			if lease, err := p.acquireID(ctx, id, model, exclude); err == nil {
 				return lease, nil
 			}
-			p.affinity.Delete(affinity)
+			p.affinity.Delete(cacheKey)
 		}
 	}
-	active := p.active.Load().([]*account)
+	active := p.schedulingSnapshot(model)
 	if len(active) == 0 {
 		p.rebuildActive()
-		active = p.active.Load().([]*account)
+		active = p.schedulingSnapshot(model)
 		if len(active) == 0 {
+			if model != "" && !p.HasModel(model) {
+				return nil, &ModelUnavailableError{Model: model}
+			}
 			return nil, p.unavailable()
 		}
 	}
 	start := int(p.cursor.Add(1)-1) % len(active)
 	for i := 0; i < len(active); i++ {
 		a := active[(start+i)%len(active)]
-		if _, skipped := exclude[a.id]; skipped || !a.available(time.Now()) {
+		if _, skipped := exclude[a.id]; skipped || !a.available(time.Now()) || !a.supportsModel(model) {
 			continue
 		}
 		if err := p.ensureFresh(ctx, a, false); err != nil {
@@ -207,25 +232,38 @@ func (p *Pool) Acquire(ctx context.Context, affinity string, exclude map[string]
 		}
 		a.inflight.Add(1)
 		if affinity != "" {
-			p.affinity.Set(affinity, a.id)
+			p.affinity.Set(cacheKey, a.id)
 		}
 		return &Lease{pool: p, account: a}, nil
+	}
+	if model != "" && !p.HasModel(model) {
+		return nil, &ModelUnavailableError{Model: model}
 	}
 	return nil, p.unavailable()
 }
 
-func (p *Pool) AcquireAccount(ctx context.Context, id string) (*Lease, error) {
-	return p.acquireID(ctx, id, nil)
+func (p *Pool) schedulingSnapshot(model string) []*account {
+	if model == "" {
+		return p.active.Load().([]*account)
+	}
+	return p.activeByModel.Load().(map[string][]*account)[model]
 }
 
-func (p *Pool) acquireID(ctx context.Context, id string, exclude map[string]struct{}) (*Lease, error) {
-	if _, skipped := exclude[id]; skipped {
-		return nil, ErrNoAuth
-	}
+func (p *Pool) AcquireAccount(ctx context.Context, id string) (*Lease, error) {
+	return p.acquireID(ctx, id, "", nil)
+}
+
+// AcquireAccountForMetadata ignores quota/rate cooldowns so non-generative
+// capability discovery can still refresh an account's model catalog.
+func (p *Pool) AcquireAccountForMetadata(ctx context.Context, id string) (*Lease, error) {
 	p.mu.RLock()
 	a := p.accounts[id]
 	p.mu.RUnlock()
-	if a == nil || !a.available(time.Now()) {
+	if a == nil {
+		return nil, ErrNoAuth
+	}
+	_, _, disabled := a.snapshot()
+	if disabled {
 		return nil, ErrNoAuth
 	}
 	if err := p.ensureFresh(ctx, a, false); err != nil {
@@ -235,15 +273,32 @@ func (p *Pool) acquireID(ctx context.Context, id string, exclude map[string]stru
 	return &Lease{pool: p, account: a}, nil
 }
 
-func (p *Pool) Bind(affinity, accountID string) {
+func (p *Pool) acquireID(ctx context.Context, id, model string, exclude map[string]struct{}) (*Lease, error) {
+	if _, skipped := exclude[id]; skipped {
+		return nil, ErrNoAuth
+	}
+	p.mu.RLock()
+	a := p.accounts[id]
+	p.mu.RUnlock()
+	if a == nil || !a.available(time.Now()) || !a.supportsModel(model) {
+		return nil, ErrNoAuth
+	}
+	if err := p.ensureFresh(ctx, a, false); err != nil {
+		return nil, err
+	}
+	a.inflight.Add(1)
+	return &Lease{pool: p, account: a}, nil
+}
+
+func (p *Pool) Bind(affinity, model, accountID string) {
 	if affinity != "" && accountID != "" {
-		p.affinity.Set(affinity, accountID)
+		p.affinity.Set(modelAffinityKey(affinity, model), accountID)
 	}
 }
 
-func (p *Pool) BindResponseID(responseID, accountID string) {
+func (p *Pool) BindResponseID(responseID, model, accountID string) {
 	if responseID != "" {
-		p.affinity.Set("previous:"+responseID, accountID)
+		p.affinity.Set(modelAffinityKey("previous:"+responseID, model), accountID)
 	}
 }
 
@@ -258,6 +313,103 @@ func (p *Pool) AccountIDs() []string {
 	p.mu.RUnlock()
 	sort.Strings(ids)
 	return ids
+}
+
+func (p *Pool) Models() []string {
+	seen := map[string]struct{}{}
+	p.mu.RLock()
+	for _, a := range p.accounts {
+		a.mu.RLock()
+		if !a.disabled && a.credential != nil {
+			for _, model := range a.credential.Models {
+				seen[model] = struct{}{}
+			}
+		}
+		a.mu.RUnlock()
+	}
+	p.mu.RUnlock()
+	models := make([]string, 0, len(seen))
+	for model := range seen {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	return models
+}
+
+func (p *Pool) HasModel(model string) bool {
+	if model == "" {
+		return true
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, a := range p.accounts {
+		if a.supportsModel(model) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Pool) AccountsNeedingModelRefresh(interval time.Duration) []string {
+	now := time.Now()
+	p.mu.RLock()
+	ids := make([]string, 0, len(p.accounts))
+	for id, a := range p.accounts {
+		a.mu.RLock()
+		needs := !a.disabled && a.credential != nil && (len(a.credential.Models) == 0 || a.credential.ModelsUpdatedAt.IsZero() || now.Sub(a.credential.ModelsUpdatedAt) >= interval)
+		a.mu.RUnlock()
+		if needs {
+			ids = append(ids, id)
+		}
+	}
+	p.mu.RUnlock()
+	sort.Strings(ids)
+	return ids
+}
+
+func (p *Pool) UpdateModels(accountID string, models []string, updatedAt time.Time) error {
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return ErrNoAuth
+	}
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	cred, _, disabled := a.snapshot()
+	if cred == nil || disabled {
+		return ErrNoAuth
+	}
+	normalized := stringSlice(models)
+	if len(normalized) == 0 {
+		return errors.New("upstream returned no models")
+	}
+	next := *cred
+	next.Raw = cloneMap(cred.Raw)
+	next.Models = normalized
+	next.ModelsUpdatedAt = updatedAt.UTC()
+	node := credentialNode(next.Raw)
+	node["models"] = normalized
+	node["models_updated_at"] = next.ModelsUpdatedAt.Format(time.RFC3339Nano)
+	if err := writeCredentialAtomic(next.Path, next.Raw); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.credential = &next
+	a.mu.Unlock()
+	p.mu.Lock()
+	if info, err := os.Stat(next.Path); err == nil {
+		p.files[next.Path] = fileEntry{size: info.Size(), modTime: info.ModTime(), cred: &next}
+	}
+	p.mu.Unlock()
+	p.requestRebuild()
+	return nil
+}
+
+// RebuildSchedulingSnapshot publishes a consistent account index after a
+// batch of model-catalog updates. Routine state changes remain debounce-batched.
+func (p *Pool) RebuildSchedulingSnapshot() {
+	p.rebuildActive()
 }
 
 func (p *Pool) Refresh(ctx context.Context, accountID string) error {
@@ -414,11 +566,16 @@ func (p *Pool) ensureFresh(ctx context.Context, a *account, force bool) error {
 	a.credential = next
 	a.disabled = false
 	a.disableReason = ""
-	a.cooldownUntil = time.Time{}
-	a.cooldownCause = ""
+	keepCooldown := time.Now().Before(a.cooldownUntil) && a.cooldownCause != "" && a.cooldownCause != "refresh_backoff"
+	if !keepCooldown {
+		a.cooldownUntil = time.Time{}
+		a.cooldownCause = ""
+	}
 	a.mu.Unlock()
 	p.mu.Lock()
-	delete(p.states, a.id)
+	if !keepCooldown {
+		delete(p.states, a.id)
+	}
 	if cached, ok := p.files[next.Path]; ok {
 		if info, statErr := os.Stat(next.Path); statErr == nil {
 			cached.modTime, cached.size, cached.cred = info.ModTime(), info.Size(), next
@@ -600,14 +757,31 @@ func (p *Pool) rebuildActive() {
 	now := time.Now()
 	p.mu.RLock()
 	active := make([]*account, 0, len(p.accounts))
+	byModel := map[string][]*account{}
 	for _, a := range p.accounts {
-		if a.available(now) {
-			active = append(active, a)
+		a.mu.RLock()
+		available := !a.disabled && !now.Before(a.cooldownUntil) && a.credential != nil
+		var models []string
+		if available {
+			models = append(models, a.credential.Models...)
+		}
+		a.mu.RUnlock()
+		if !available {
+			continue
+		}
+		active = append(active, a)
+		for _, model := range models {
+			byModel[model] = append(byModel[model], a)
 		}
 	}
 	p.mu.RUnlock()
 	sort.Slice(active, func(i, j int) bool { return active[i].id < active[j].id })
+	for model := range byModel {
+		accounts := byModel[model]
+		sort.Slice(accounts, func(i, j int) bool { return accounts[i].id < accounts[j].id })
+	}
 	p.active.Store(active)
+	p.activeByModel.Store(byModel)
 }
 
 func (p *Pool) requestRebuild() {
@@ -744,6 +918,13 @@ func newAffinityCache(ttl time.Duration, maxEntries int) *affinityCache {
 func affinityHash(key string) (string, byte) {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:]), sum[0]
+}
+
+func modelAffinityKey(affinity, model string) string {
+	if affinity == "" {
+		return ""
+	}
+	return affinity + "\x00" + model
 }
 
 func (c *affinityCache) Get(key string) (string, bool) {

@@ -20,7 +20,8 @@
 - 支持会话亲和、账号轮询、自动重试和额度冷却
 - 可配置本地 API Key 访问保护
 - 支持 HTTP、HTTPS、SOCKS5 和 SOCKS5H 出站代理
-- 内置模型列表和 Grok 只读透传接口
+- 按账号发现并聚合上游模型，按模型能力调度请求
+- Grok 只读透传接口
 - 仅使用 Go 标准库，便于构建和部署
 
 ## API 兼容性
@@ -63,7 +64,7 @@ mkdir auths
 # auths/account-2.json
 ```
 
-`auths` 已被 Git 忽略。服务会热加载文件并原子写回刷新的 token，因此目录必须可写。
+`auths` 已被 Git 忽略。服务会热加载文件并原子写回刷新的 token，因此目录必须可写。服务还会查询每个账号的上游模型目录，并将规范化后的 `models` 和 `models_updated_at` 字段写回对应凭证 JSON。
 
 启动服务：
 
@@ -164,6 +165,7 @@ curl http://localhost:8088/v1/messages \
 | `GROK_AUTHS_DIR` | `./auths` | 非递归扫描的可写 OAuth JSON 目录 |
 | `GROK_AUTHS_RELOAD_INTERVAL` | `30s` | 凭证目录热加载周期 |
 | `GROK_AUTH_REFRESH_CONCURRENCY` | `4` | OAuth 刷新并发数 |
+| `GROK_MODELS_REFRESH_INTERVAL` | `6h` | 每个账号模型目录的刷新周期 |
 | `GROK_RETRY_MAX_ATTEMPTS` | `3` | 单个请求最多尝试的不同账号数 |
 | `GROK_RETRY_BASE_DELAY` | `200ms` | 可重试网络与 5xx 错误的基础退避 |
 | `GROK_RATE_LIMIT_COOLDOWN` | `1m` | 无 `Retry-After` 时的 429 冷却时间 |
@@ -210,7 +212,13 @@ go run ./cmd/grok2api -version
 
 服务还提供 `/v1/grok/settings`、`user`、`billing`、`mcp/configs`、`mcp/tools/list` 和 `feedback/config` 只读透传接口。
 
-当前公开的模型标识包括 `grok-build`、`grok-4`、`grok-4.5`、`grok-auto`、`grok-4-fast-reasoning`、`grok-4-fast-non-reasoning`、`grok-3`、`grok-3-mini`、`grok-code-fast-1` 和 `grok-2-vision`。实际可用性取决于上游服务和账号权限。
+模型列表不是本地硬编码的。启动时服务会读取凭证 JSON 中的缓存目录，并为缺少或超过刷新周期的账号调用上游 `/v1/models`；新增账号也会在热加载后自动发现。`GET /v1/models` 返回所有有效账号目录的去重并集，请求只会调度到声明支持目标模型的账号。服务不会添加模型别名或改写请求中的模型 ID。
+
+每个凭证文件中持久化的 `models` 与 `models_updated_at` 仅用于能力目录和调度，刷新 token 时会保留；实际支持范围仍以上游账号返回结果为准。调用生成接口前可先查询：
+
+```bash
+curl http://localhost:8088/v1/models
+```
 
 ## 安全建议
 

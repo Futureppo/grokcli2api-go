@@ -26,7 +26,7 @@ func TestPrepareMapsMultimodalToolsAndThinking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prepared.Body["model"] != "grok-build" || prepared.Body["max_output_tokens"] != float64(4096) {
+	if prepared.Body["model"] != "grok-4" || prepared.Body["max_output_tokens"] != float64(4096) {
 		t.Fatalf("prepared=%#v", prepared.Body)
 	}
 	reasoning := prepared.Body["reasoning"].(map[string]any)

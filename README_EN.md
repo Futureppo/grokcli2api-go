@@ -20,7 +20,8 @@
 - Session affinity, account rotation, retries, and quota cooldowns
 - Optional local API-key protection
 - HTTP, HTTPS, SOCKS5, and SOCKS5H outbound proxies
-- Built-in model discovery and read-only Grok passthrough endpoints
+- Per-account upstream model discovery, aggregation, and capability-aware scheduling
+- Read-only Grok passthrough endpoints
 - Standard-library-only Go implementation for simple builds and deployments
 
 ## API compatibility
@@ -63,7 +64,7 @@ mkdir auths
 # auths/account-2.json
 ```
 
-`auths` is ignored by Git. The service hot-reloads files and atomically writes refreshed tokens back, so the directory must be writable.
+`auths` is ignored by Git. The service hot-reloads files and atomically writes refreshed tokens back, so the directory must be writable. It also queries the upstream model catalog for every account and writes normalized `models` and `models_updated_at` fields back to the corresponding credential JSON.
 
 Start the service:
 
@@ -164,6 +165,7 @@ The service loads environment variables that are not already set from a `.env` f
 | `GROK_AUTHS_DIR` | `./auths` | Writable, non-recursive OAuth JSON directory |
 | `GROK_AUTHS_RELOAD_INTERVAL` | `30s` | Credential hot-reload interval |
 | `GROK_AUTH_REFRESH_CONCURRENCY` | `4` | Maximum concurrent OAuth refreshes |
+| `GROK_MODELS_REFRESH_INTERVAL` | `6h` | Per-account model-catalog refresh interval |
 | `GROK_RETRY_MAX_ATTEMPTS` | `3` | Maximum distinct accounts tried per request |
 | `GROK_RETRY_BASE_DELAY` | `200ms` | Base delay for retryable network and 5xx failures |
 | `GROK_RATE_LIMIT_COOLDOWN` | `1m` | 429 cooldown when `Retry-After` is absent |
@@ -210,7 +212,13 @@ go run ./cmd/grok2api -version
 
 The service also provides read-only `/v1/grok/settings`, `user`, `billing`, `mcp/configs`, `mcp/tools/list`, and `feedback/config` passthrough endpoints.
 
-Currently advertised model IDs include `grok-build`, `grok-4`, `grok-4.5`, `grok-auto`, `grok-4-fast-reasoning`, `grok-4-fast-non-reasoning`, `grok-3`, `grok-3-mini`, `grok-code-fast-1`, and `grok-2-vision`. Actual availability depends on the upstream service and account permissions.
+The model list is not hardcoded locally. At startup, the service reads cached catalogs from credential JSON files and calls upstream `/v1/models` for accounts whose catalog is missing or older than the refresh interval. Newly hot-loaded accounts are discovered automatically. `GET /v1/models` returns the deduplicated union across valid accounts, and requests are scheduled only to accounts that advertise the requested model. The service does not add model aliases or rewrite requested model IDs.
+
+The persisted `models` and `models_updated_at` fields are used only for capability discovery and scheduling and are preserved during token refresh. Actual availability remains controlled by the upstream account. Query the catalog before sending generation requests:
+
+```bash
+curl http://localhost:8088/v1/models
+```
 
 ## Security
 

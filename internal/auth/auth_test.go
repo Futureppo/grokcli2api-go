@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -104,6 +105,27 @@ func TestConcurrentRefreshIsSingleFlight(t *testing.T) {
 	}
 }
 
+func TestRefreshPreservesQuotaCooldown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"token-new","refresh_token":"refresh-new","expires_in":3600}`))
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-old", time.Now().Add(time.Hour), server.URL)
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	id := accountID("subject-a")
+	pool.MarkCooldown(id, "quota_exhausted", time.Hour)
+	if err := pool.Refresh(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if lease, err := pool.AcquireAccount(context.Background(), id); err == nil {
+		lease.Release()
+		t.Fatal("OAuth refresh cleared the quota cooldown")
+	}
+}
+
 func TestPoolRoundRobinAffinityAndConcurrentLease(t *testing.T) {
 	dir := t.TempDir()
 	for i := 0; i < 3; i++ {
@@ -113,7 +135,7 @@ func TestPoolRoundRobinAffinityAndConcurrentLease(t *testing.T) {
 	defer pool.Close()
 	seen := map[string]bool{}
 	for i := 0; i < 3; i++ {
-		lease, err := pool.Acquire(context.Background(), "", nil)
+		lease, err := pool.Acquire(context.Background(), "", "grok-4", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -123,14 +145,14 @@ func TestPoolRoundRobinAffinityAndConcurrentLease(t *testing.T) {
 	if len(seen) != 3 {
 		t.Fatalf("round robin selected %d accounts", len(seen))
 	}
-	first, err := pool.Acquire(context.Background(), "session:one", nil)
+	first, err := pool.Acquire(context.Background(), "session:one", "grok-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := first.AccountID()
 	first.Release()
-	pool.BindResponseID("resp-one", id)
-	byResponse, err := pool.Acquire(context.Background(), "previous:resp-one", nil)
+	pool.BindResponseID("resp-one", "grok-4", id)
+	byResponse, err := pool.Acquire(context.Background(), "previous:resp-one", "grok-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +165,7 @@ func TestPoolRoundRobinAffinityAndConcurrentLease(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lease, err := pool.Acquire(context.Background(), "session:one", nil)
+			lease, err := pool.Acquire(context.Background(), "session:one", "grok-4", nil)
 			if err != nil {
 				t.Error(err)
 				return
@@ -165,6 +187,47 @@ func TestPoolDeduplicatesAccountsBySubject(t *testing.T) {
 	defer pool.Close()
 	if got := len(pool.AccountIDs()); got != 1 {
 		t.Fatalf("deduplicated account count = %d, want 1", got)
+	}
+}
+
+func TestPoolAggregatesPersistsAndSchedulesModels(t *testing.T) {
+	dir := t.TempDir()
+	pathA := writeTestCredentialModels(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "", []string{"grok-alpha", "grok-shared"})
+	writeTestCredentialModels(t, dir, "b.json", "subject-b", "token-b", time.Now().Add(time.Hour), "", []string{"grok-beta", "grok-shared"})
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+
+	if got, want := strings.Join(pool.Models(), ","), "grok-alpha,grok-beta,grok-shared"; got != want {
+		t.Fatalf("aggregated models = %q, want %q", got, want)
+	}
+	lease, err := pool.Acquire(context.Background(), "session:beta", "grok-beta", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := lease.AccountID(), accountID("subject-b"); got != want {
+		t.Fatalf("grok-beta scheduled to account %q, want %q", got, want)
+	}
+	lease.Release()
+
+	_, err = pool.Acquire(context.Background(), "", "grok-unknown", nil)
+	var unavailable *ModelUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Model != "grok-unknown" {
+		t.Fatalf("unknown model error = %v, want ModelUnavailableError", err)
+	}
+
+	updatedAt := time.Now().UTC().Truncate(time.Nanosecond)
+	if err := pool.UpdateModels(accountID("subject-a"), []string{"grok-new", "grok-new", " grok-shared "}, updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	credential, err := loadCredential(pathA, "tui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(credential.Models, ","), "grok-new,grok-shared"; got != want {
+		t.Fatalf("persisted models = %q, want %q", got, want)
+	}
+	if !credential.ModelsUpdatedAt.Equal(updatedAt) {
+		t.Fatalf("persisted models_updated_at = %s, want %s", credential.ModelsUpdatedAt, updatedAt)
 	}
 }
 
@@ -196,14 +259,14 @@ func TestCooldownPersistsAndAffinityMigrates(t *testing.T) {
 	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
 	writeTestCredential(t, dir, "b.json", "subject-b", "token-b", time.Now().Add(time.Hour), "")
 	pool := newTestPool(t, dir)
-	lease, err := pool.Acquire(context.Background(), "session:one", nil)
+	lease, err := pool.Acquire(context.Background(), "session:one", "grok-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cooledID := lease.AccountID()
 	lease.Release()
 	pool.MarkCooldown(cooledID, "quota_exhausted", time.Hour)
-	migrated, err := pool.Acquire(context.Background(), "session:one", nil)
+	migrated, err := pool.Acquire(context.Background(), "session:one", "grok-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,14 +326,15 @@ func BenchmarkPoolAcquireTenThousandAccounts(b *testing.B) {
 	active := make([]*account, 10000)
 	for i := range active {
 		id := fmt.Sprintf("%024d", i)
-		a := &account{id: id, credential: &credential{AccessToken: "token", Subject: id, ExpiresAt: time.Now().Add(time.Hour)}, agentID: "agent", sessionID: "session"}
+		a := &account{id: id, credential: &credential{AccessToken: "token", Subject: id, ExpiresAt: time.Now().Add(time.Hour), Models: []string{"grok-4"}}, agentID: "agent", sessionID: "session"}
 		p.accounts[id], active[i] = a, a
 	}
 	p.active.Store(active)
+	p.activeByModel.Store(map[string][]*account{"grok-4": active})
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			lease, err := p.Acquire(context.Background(), "", nil)
+			lease, err := p.Acquire(context.Background(), "", "grok-4", nil)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -290,6 +354,11 @@ func newTestPool(t *testing.T, dir string) *Pool {
 
 func writeTestCredential(t *testing.T, dir, name, subject, token string, expires time.Time, tokenURL string) string {
 	t.Helper()
+	return writeTestCredentialModels(t, dir, name, subject, token, expires, tokenURL, []string{"grok-4"})
+}
+
+func writeTestCredentialModels(t *testing.T, dir, name, subject, token string, expires time.Time, tokenURL string, models []string) string {
+	t.Helper()
 	if tokenURL == "" {
 		tokenURL = "https://auth.x.ai/oauth2/token"
 	}
@@ -298,6 +367,7 @@ func writeTestCredential(t *testing.T, dir, name, subject, token string, expires
 		"refresh_token": "refresh-a", "client_id": "client-id", "sub": subject,
 		"expired": expires.UTC().Format(time.RFC3339Nano), "expires_in": 3600,
 		"token_endpoint": tokenURL,
+		"models":         models, "models_updated_at": time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	b, err := json.Marshal(raw)
 	if err != nil {

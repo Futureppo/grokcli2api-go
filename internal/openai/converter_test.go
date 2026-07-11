@@ -13,10 +13,10 @@ func TestPrepareChatPreservesExtensions(t *testing.T) {
 	}
 }
 
-func TestPrepareResponsesMapsModel(t *testing.T) {
+func TestPrepareResponsesPreservesModel(t *testing.T) {
 	body := map[string]any{"model": "grok-4.5", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "stream": true}
 	out := PrepareResponses(body)
-	if out["model"] != "grok-build" {
+	if out["model"] != "grok-4.5" {
 		t.Fatalf("model = %v", out["model"])
 	}
 	if out["stream"] != true {

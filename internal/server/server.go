@@ -46,12 +46,20 @@ func New(cfg config.Config) (*Server, error) {
 		pool.Close()
 		return nil, err
 	}
+	modelCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	err = client.InitializeModels(modelCtx)
+	cancel()
+	if err != nil {
+		client.Close()
+		pool.Close()
+		return nil, fmt.Errorf("initialize model catalog: %w", err)
+	}
 	s := &Server{cfg: cfg, pool: pool, client: client, mux: http.NewServeMux()}
 	s.routes()
 	return s, nil
 }
 
-func (s *Server) Close() { s.pool.Close(); s.client.Close() }
+func (s *Server) Close() { s.client.Close(); s.pool.Close() }
 
 func (s *Server) Handler() http.Handler {
 	return recoverer(requestLogger(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -100,12 +108,17 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) models(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, grok.Models())
+	ids := s.pool.Models()
+	data := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, grok.Model(id))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
 func (s *Server) model(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("model_id")
-	if !grok.HasModel(id) {
+	if !s.pool.HasModel(id) {
 		writeError(w, http.StatusNotFound, "unknown model: "+id, "invalid_request_error", "404")
 		return
 	}
@@ -126,7 +139,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wire := openai.PrepareChat(body)
-	model := openai.String(body, "model", "grok-build")
+	model := openai.String(body, "model", "")
 	affinity := requestAffinity(r, body)
 	convID := conversationID(affinity)
 	if !openai.IsStreaming(body) {
@@ -155,7 +168,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	if native {
 		wire = openai.PrepareNativeResponses(body)
 	}
-	model := openai.String(body, "model", "grok-build")
+	model := openai.String(body, "model", "")
 	affinity := requestAffinity(r, body)
 	convID := conversationID(affinity)
 	if !openai.IsStreaming(body) {
@@ -192,7 +205,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	for _, field := range prepared.Warnings {
 		slog.Warn("anthropic compatibility field stripped", "field", field, "path", r.URL.Path)
 	}
-	model := openai.String(body, "model", "grok-build")
+	model := openai.String(body, "model", "")
 	affinity := requestAffinity(r, body)
 	convID := conversationID(affinity)
 	if !openai.IsStreaming(body) {
@@ -374,6 +387,11 @@ func (s *Server) apiKeyGate(next http.Handler) http.Handler {
 }
 
 func (s *Server) writeClientError(w http.ResponseWriter, err error) {
+	var modelUnavailable *auth.ModelUnavailableError
+	if errors.As(err, &modelUnavailable) {
+		writeError(w, http.StatusNotFound, modelUnavailable.Error(), "invalid_request_error", "model_not_found")
+		return
+	}
 	var unavailable *auth.UnavailableError
 	if errors.As(err, &unavailable) {
 		writeUnavailable(w, unavailable, false)
@@ -397,6 +415,11 @@ func (s *Server) writeClientError(w http.ResponseWriter, err error) {
 }
 
 func (s *Server) writeAnthropicClientError(w http.ResponseWriter, err error) {
+	var modelUnavailable *auth.ModelUnavailableError
+	if errors.As(err, &modelUnavailable) {
+		writeAnthropicError(w, http.StatusBadRequest, modelUnavailable.Error(), "invalid_request_error")
+		return
+	}
 	var unavailable *auth.UnavailableError
 	if errors.As(err, &unavailable) {
 		writeUnavailable(w, unavailable, true)
@@ -425,6 +448,10 @@ func (s *Server) writeAnthropicClientError(w http.ResponseWriter, err error) {
 }
 
 func clientErrorPayload(err error) map[string]any {
+	var modelUnavailable *auth.ModelUnavailableError
+	if errors.As(err, &modelUnavailable) {
+		return openai.Error(modelUnavailable.Error(), "invalid_request_error", "model_not_found")
+	}
 	var unavailable *auth.UnavailableError
 	if errors.As(err, &unavailable) {
 		if unavailable.Cooling {

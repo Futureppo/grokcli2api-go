@@ -207,7 +207,7 @@ func TestResponsesDefaultsToOpenAIFormat(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if body["input"] != "hello" || body["model"] != "grok-build" || body["store"] != false {
+		if body["input"] != "hello" || body["model"] != "grok-4" || body["store"] != false {
 			t.Fatalf("wire=%#v", body)
 		}
 		writeJSON(w, 200, map[string]any{"id": "resp_1", "object": "response", "status": "completed", "output": []any{}})
@@ -376,6 +376,46 @@ func TestPublicRoutesBypassGate(t *testing.T) {
 	}
 }
 
+func TestModelsEndpointAggregatesCredentialCatalogs(t *testing.T) {
+	dir := t.TempDir()
+	writeCredentialFileModels(t, dir, "subject-a", "token-a", []string{"grok-alpha", "grok-shared"})
+	writeCredentialFileModels(t, dir, "subject-b", "token-b", []string{"grok-beta", "grok-shared"})
+	cfg := config.Config{
+		ChatProxyBaseURL: "http://127.0.0.1:1", ChatProxyVersion: "v1", AuthsDir: dir,
+		AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, ModelsRefreshInterval: 6 * time.Hour,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 1024, RetryMaxAttempts: 3,
+		RetryBaseDelay: time.Millisecond, RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour,
+		ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui",
+		ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
+	}
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0, len(response.Data))
+	for _, model := range response.Data {
+		ids = append(ids, model.ID)
+	}
+	if got, want := strings.Join(ids, ","), "grok-alpha,grok-beta,grok-shared"; got != want {
+		t.Fatalf("models = %q, want %q", got, want)
+	}
+}
+
 func TestRemovedRoutesAre404(t *testing.T) {
 	h := newTestHandler(t, "http://127.0.0.1:1", nil)
 	for _, path := range []string{"/docs", "/openapi.json", "/v1/health", "/v1/auth/status"} {
@@ -482,7 +522,12 @@ type fatalHelper interface {
 
 func writeCredentialFile(tb fatalHelper, dir, subject, token string) {
 	tb.Helper()
-	raw := map[string]any{"access_token": token, "refresh_token": "refresh", "client_id": "client", "sub": subject, "expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)}
+	writeCredentialFileModels(tb, dir, subject, token, []string{"grok-4", "grok-build"})
+}
+
+func writeCredentialFileModels(tb fatalHelper, dir, subject, token string, models []string) {
+	tb.Helper()
+	raw := map[string]any{"access_token": token, "refresh_token": "refresh", "client_id": "client", "sub": subject, "expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), "models": models, "models_updated_at": time.Now().UTC().Format(time.RFC3339Nano)}
 	b, err := json.Marshal(raw)
 	if err != nil {
 		tb.Fatal(err)

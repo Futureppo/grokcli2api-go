@@ -75,7 +75,7 @@ func PrepareChat(body map[string]any) map[string]any {
 // retaining compatibility with the old chat-shaped implementation.
 func PrepareResponses(body map[string]any) map[string]any {
 	out := clone(body)
-	out["model"] = UpstreamModel(String(body, "model", "grok-build"))
+	out["model"] = UpstreamModel(String(body, "model", ""))
 	out["stream"] = IsStreaming(body)
 	if _, ok := out["input"]; !ok {
 		if messages, legacy := out["messages"]; legacy {
@@ -123,24 +123,16 @@ func responsesTextFormat(value any) any {
 	return out
 }
 
-// PrepareNativeResponses changes only defaults that the proxy requires. All
+// PrepareNativeResponses changes only transport fields that the proxy requires. All
 // Grok-specific fields and extension items remain untouched.
 func PrepareNativeResponses(body map[string]any) map[string]any {
 	out := clone(body)
 	out["stream"] = IsStreaming(body)
-	if _, ok := out["model"]; !ok {
-		out["model"] = "grok-build"
-	}
 	return out
 }
 
 func UpstreamModel(model string) string {
-	switch model {
-	case "grok-4", "grok-4.5", "grok-auto", "grok-build":
-		return "grok-build"
-	default:
-		return model
-	}
+	return model
 }
 
 func Normalize(raw map[string]any, fallbackModel string, stream bool) map[string]any {

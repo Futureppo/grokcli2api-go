@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,9 +57,14 @@ func (e *APIError) Error() string {
 }
 
 type Client struct {
-	cfg  config.Config
-	pool *auth.Pool
-	http *http.Client
+	cfg        config.Config
+	pool       *auth.Pool
+	http       *http.Client
+	modelsMu   sync.Mutex
+	modelStart sync.Once
+	modelClose chan struct{}
+	modelWG    sync.WaitGroup
+	closeOnce  sync.Once
 }
 
 type SSEEvent struct {
@@ -74,6 +81,7 @@ type EventStream struct {
 	pool          *auth.Pool
 	lease         *auth.Lease
 	accountID     string
+	model         string
 	quotaCooldown time.Duration
 	closeOnce     sync.Once
 }
@@ -127,6 +135,9 @@ func NewClient(cfg config.Config, pool *auth.Pool, httpClient *http.Client) (*Cl
 	if cfg.QuotaCooldown <= 0 {
 		cfg.QuotaCooldown = 24 * time.Hour
 	}
+	if cfg.ModelsRefreshInterval <= 0 {
+		cfg.ModelsRefreshInterval = 6 * time.Hour
+	}
 	if httpClient == nil {
 		var err error
 		httpClient, err = NewHTTPClient(cfg)
@@ -134,7 +145,7 @@ func NewClient(cfg config.Config, pool *auth.Pool, httpClient *http.Client) (*Cl
 			return nil, err
 		}
 	}
-	return &Client{cfg: cfg, pool: pool, http: httpClient}, nil
+	return &Client{cfg: cfg, pool: pool, http: httpClient, modelClose: make(chan struct{})}, nil
 }
 
 func splitProxyPatterns(raw string) []string {
@@ -170,7 +181,171 @@ func bypassProxy(host string, patterns []string) bool {
 	return false
 }
 
-func (c *Client) Close() { c.http.CloseIdleConnections() }
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		close(c.modelClose)
+		c.modelWG.Wait()
+		c.http.CloseIdleConnections()
+	})
+}
+
+func (c *Client) InitializeModels(ctx context.Context) error {
+	if err := c.RefreshModels(ctx, false); err != nil && len(c.pool.Models()) == 0 {
+		return err
+	}
+	if len(c.pool.Models()) == 0 {
+		return errors.New("no models discovered from credential accounts")
+	}
+	c.modelStart.Do(func() {
+		c.modelWG.Add(1)
+		go c.modelRefreshLoop()
+	})
+	return nil
+}
+
+func (c *Client) RefreshModels(ctx context.Context, force bool) error {
+	c.modelsMu.Lock()
+	defer c.modelsMu.Unlock()
+	ids := c.pool.AccountIDs()
+	if !force {
+		ids = c.pool.AccountsNeedingModelRefresh(c.cfg.ModelsRefreshInterval)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	workers := c.cfg.AuthRefreshConcurrency
+	if workers < 1 {
+		workers = 4
+	}
+	if workers > len(ids) {
+		workers = len(ids)
+	}
+	jobs := make(chan string)
+	results := make(chan error, len(ids))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for id := range jobs {
+				models, err := c.fetchAccountModels(ctx, id, false)
+				if err == nil {
+					err = c.pool.UpdateModels(id, models, time.Now())
+				}
+				results <- err
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, id := range ids {
+			select {
+			case jobs <- id:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(results)
+	succeeded := 0
+	for err := range results {
+		if err == nil {
+			succeeded++
+		}
+	}
+	c.pool.RebuildSchedulingSnapshot()
+	slog.Info("account model catalogs refreshed", "requested", len(ids), "succeeded", succeeded, "failed", len(ids)-succeeded, "models", len(c.pool.Models()))
+	if succeeded != len(ids) {
+		return fmt.Errorf("model discovery failed for %d of %d credential accounts", len(ids)-succeeded, len(ids))
+	}
+	return nil
+}
+
+func (c *Client) fetchAccountModels(ctx context.Context, accountID string, refreshed bool) ([]string, error) {
+	lease, err := c.pool.AcquireAccountForMetadata(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer lease.Release()
+	resp, _, err := c.do(ctx, lease, http.MethodGet, "models", nil, NewID(), "", false, false)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	payload, err := readResponseBody(resp, 4<<20)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		apiErr := parseAPIError(resp, payload)
+		if isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
+			return c.fetchAccountModels(ctx, accountID, true)
+		}
+		return nil, apiErr
+	}
+	return parseModelIDs(payload)
+}
+
+func parseModelIDs(payload []byte) ([]string, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil, err
+	}
+	seen := map[string]struct{}{}
+	collect := func(values any) {
+		items, _ := values.([]any)
+		for _, item := range items {
+			switch value := item.(type) {
+			case string:
+				if strings.TrimSpace(value) != "" {
+					seen[strings.TrimSpace(value)] = struct{}{}
+				}
+			case map[string]any:
+				id := stringField(value, "id")
+				if id == "" {
+					id = stringField(value, "name")
+				}
+				if id != "" {
+					seen[id] = struct{}{}
+				}
+			}
+		}
+	}
+	collect(raw["data"])
+	collect(raw["models"])
+	models := make([]string, 0, len(seen))
+	for id := range seen {
+		models = append(models, id)
+	}
+	sort.Strings(models)
+	if len(models) == 0 {
+		return nil, errors.New("upstream returned an empty model catalog")
+	}
+	return models, nil
+}
+
+func (c *Client) modelRefreshLoop() {
+	defer c.modelWG.Done()
+	checkInterval := c.cfg.AuthsReloadInterval
+	if checkInterval <= 0 {
+		checkInterval = 30 * time.Second
+	}
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if err := c.RefreshModels(ctx, false); err != nil {
+				slog.Warn("account model refresh failed", "error", err)
+			}
+			cancel()
+		case <-c.modelClose:
+			return
+		}
+	}
+}
 
 func (c *Client) URL(path string) string {
 	return c.cfg.ChatProxyBaseURL + "/" + c.cfg.ChatProxyVersion + "/" + strings.TrimLeft(path, "/")
@@ -192,7 +367,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			lease, err = c.pool.AcquireAccount(ctx, preferredID)
 			preferredID = ""
 		} else {
-			lease, err = c.pool.Acquire(ctx, affinity, used)
+			lease, err = c.pool.Acquire(ctx, affinity, model, used)
 		}
 		if err != nil {
 			var unavailable *auth.UnavailableError
@@ -261,7 +436,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			continue
 		}
 		lease.Release()
-		return c.decodeSuccess(data, affinity, accountID)
+		return c.decodeSuccess(data, affinity, model, accountID)
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -269,8 +444,8 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 	return nil, auth.ErrNoAuth
 }
 
-func (c *Client) decodeSuccess(payload []byte, affinity, accountID string) (map[string]any, error) {
-	c.pool.Bind(affinity, accountID)
+func (c *Client) decodeSuccess(payload []byte, affinity, model, accountID string) (map[string]any, error) {
+	c.pool.Bind(affinity, model, accountID)
 	if len(payload) == 0 {
 		return map[string]any{}, nil
 	}
@@ -279,7 +454,7 @@ func (c *Client) decodeSuccess(payload []byte, affinity, accountID string) (map[
 		return map[string]any{"raw": string(payload)}, nil
 	}
 	if id := responseID(out); id != "" {
-		c.pool.BindResponseID(id, accountID)
+		c.pool.BindResponseID(id, model, accountID)
 	}
 	return out, nil
 }
@@ -300,7 +475,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			lease, err = c.pool.AcquireAccount(ctx, preferredID)
 			preferredID = ""
 		} else {
-			lease, err = c.pool.Acquire(ctx, affinity, used)
+			lease, err = c.pool.Acquire(ctx, affinity, model, used)
 		}
 		if err != nil {
 			var unavailable *auth.UnavailableError
@@ -368,10 +543,10 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			}
 			continue
 		}
-		c.pool.Bind(affinity, accountID)
+		c.pool.Bind(affinity, model, accountID)
 		scanner := bufio.NewScanner(responseReader(resp))
 		scanner.Buffer(make([]byte, 64*1024), 4<<20)
-		return &EventStream{response: resp, scanner: scanner, pool: c.pool, lease: lease, accountID: accountID, quotaCooldown: c.cfg.QuotaCooldown}, nil
+		return &EventStream{response: resp, scanner: scanner, pool: c.pool, lease: lease, accountID: accountID, model: model, quotaCooldown: c.cfg.QuotaCooldown}, nil
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -536,7 +711,7 @@ func (s *EventStream) observe(data []byte) {
 		return
 	}
 	if id := responseID(payload); id != "" {
-		s.pool.BindResponseID(id, s.accountID)
+		s.pool.BindResponseID(id, s.model, s.accountID)
 	}
 	code := stringField(payload, "code")
 	if inner, ok := payload["error"].(map[string]any); ok && code == "" {

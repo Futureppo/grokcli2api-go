@@ -27,7 +27,7 @@ func TestLiveCredentialPool(t *testing.T) {
 	}
 	cfg := config.Config{
 		ChatProxyBaseURL: "https://cli-chat-proxy.grok.com", ChatProxyVersion: "v1",
-		ProxyURL:   os.Getenv("GROK_PROXY_URL"),
+		ProxyURL: os.Getenv("GROK_PROXY_URL"), AuthRefreshConcurrency: 2, ModelsRefreshInterval: 6 * time.Hour,
 		ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
 		RetryMaxAttempts: 1, RetryBaseDelay: 200 * time.Millisecond, RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour,
 	}
@@ -48,21 +48,26 @@ func TestLiveCredentialPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
+	modelCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	err = client.RefreshModels(modelCtx, true)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending := pool.AccountsNeedingModelRefresh(6 * time.Hour); len(pending) != 0 {
+		t.Fatalf("model catalogs were not persisted for %d credential accounts", len(pending))
+	}
 
-	type result struct{ models, billing int }
 	ids := pool.AccountIDs()
 	jobs := make(chan string)
-	results := make(chan result, len(ids))
+	results := make(chan int, len(ids))
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for id := range jobs {
-				results <- result{
-					models:  probeAccountStatus(client, pool, id, "models"),
-					billing: probeAccountStatus(client, pool, id, "billing?format=credits"),
-				}
+				results <- probeAccountStatus(client, pool, id, "billing?format=credits")
 			}
 		}()
 	}
@@ -72,21 +77,20 @@ func TestLiveCredentialPool(t *testing.T) {
 	close(jobs)
 	wg.Wait()
 	close(results)
-	models, billing := map[int]int{}, map[int]int{}
-	for item := range results {
-		models[item.models]++
-		billing[item.billing]++
+	billing := map[int]int{}
+	for status := range results {
+		billing[status]++
 	}
-	t.Logf("anonymous probe summary: accounts=%d models=%s billing=%s", len(ids), statusSummary(models), statusSummary(billing))
-	if models[http.StatusOK] != len(ids) {
-		t.Fatalf("models probe did not succeed for every account: %s", statusSummary(models))
+	t.Logf("anonymous probe summary: accounts=%d aggregate_models=%d billing=%s", len(ids), len(pool.Models()), statusSummary(billing))
+	if billing[http.StatusOK] != len(ids) {
+		t.Fatalf("billing probe did not succeed for every account: %s", statusSummary(billing))
 	}
 }
 
 func probeAccountStatus(client *Client, pool *auth.Pool, accountID, path string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	lease, err := pool.AcquireAccount(ctx, accountID)
+	lease, err := pool.AcquireAccountForMetadata(ctx, accountID)
 	if err != nil {
 		return 0
 	}

@@ -21,6 +21,7 @@ type Config struct {
 	AuthsDir               string
 	AuthsReloadInterval    time.Duration
 	AuthRefreshConcurrency int
+	ModelsRefreshInterval  time.Duration
 	RetryMaxAttempts       int
 	RetryBaseDelay         time.Duration
 	RateLimitCooldown      time.Duration
@@ -62,6 +63,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	modelsRefreshInterval, err := envDuration("GROK_MODELS_REFRESH_INTERVAL", 6*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
 	retryBaseDelay, err := envDuration("GROK_RETRY_BASE_DELAY", 200*time.Millisecond)
 	if err != nil {
 		return Config{}, err
@@ -87,6 +92,7 @@ func Load() (Config, error) {
 		AuthsDir:               expandHome(env("GROK_AUTHS_DIR", "./auths")),
 		AuthsReloadInterval:    reloadInterval,
 		AuthRefreshConcurrency: refreshConcurrency,
+		ModelsRefreshInterval:  modelsRefreshInterval,
 		RetryMaxAttempts:       retryAttempts,
 		RetryBaseDelay:         retryBaseDelay,
 		RateLimitCooldown:      rateLimitCooldown,
