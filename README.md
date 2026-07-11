@@ -205,8 +205,8 @@ go run ./cmd/grok2api -version
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/` | 服务信息 |
-| `GET` | `/v1/models` | 模型列表 |
-| `GET` | `/v1/models/{model_id}` | 模型详情 |
+| `GET` | `/v1/models` | 模型列表（配置本地 API Key 时需鉴权） |
+| `GET` | `/v1/models/{model_id}` | 模型详情（配置本地 API Key 时需鉴权） |
 | `GET` | `/v1/auth/api-key` | 本地 API Key 保护状态 |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions 兼容接口 |
 | `POST` | `/v1/responses` | OpenAI Responses 兼容接口 |
@@ -219,7 +219,8 @@ go run ./cmd/grok2api -version
 每个凭证文件中持久化的 `models` 与 `models_updated_at` 仅用于能力目录和调度，刷新 token 时会保留；实际支持范围仍以上游账号返回结果为准。调用生成接口前可先查询：
 
 ```bash
-curl http://localhost:8088/v1/models
+curl http://localhost:8088/v1/models \
+  -H "Authorization: Bearer local-api-key"
 ```
 
 ## 安全建议

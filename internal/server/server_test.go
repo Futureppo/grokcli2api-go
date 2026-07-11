@@ -367,11 +367,28 @@ func TestStreamingUpstreamErrorKeepsHTTPStatus(t *testing.T) {
 
 func TestPublicRoutesBypassGate(t *testing.T) {
 	h := newTestHandler(t, "http://127.0.0.1:1", []string{"key"})
-	for _, path := range []string{"/v1/models", "/v1/auth/api-key"} {
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/auth/api-key", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestModelRoutesRequireAPIKey(t *testing.T) {
+	h := newTestHandler(t, "http://127.0.0.1:1", []string{"key"})
+	for _, path := range []string{"/v1/models", "/v1/models/grok-4"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
-		if rec.Code != 200 {
-			t.Errorf("%s status = %d", path, rec.Code)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s without key: status = %d", path, rec.Code)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer key")
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s with key: status = %d, body=%s", path, rec.Code, rec.Body.String())
 		}
 	}
 }

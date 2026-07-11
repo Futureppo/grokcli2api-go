@@ -70,8 +70,8 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/", s.root)
-	s.mux.HandleFunc("GET /v1/models", s.models)
-	s.mux.HandleFunc("GET /v1/models/{model_id}", s.model)
+	s.protected("GET /v1/models", s.models)
+	s.protected("GET /v1/models/{model_id}", s.model)
 	s.mux.HandleFunc("GET /v1/auth/api-key", s.apiKeyStatus)
 
 	s.protected("POST /v1/chat/completions", s.chat)

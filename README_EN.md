@@ -205,8 +205,8 @@ go run ./cmd/grok2api -version
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/` | Service information |
-| `GET` | `/v1/models` | List models |
-| `GET` | `/v1/models/{model_id}` | Get model details |
+| `GET` | `/v1/models` | List models (authenticated when a local API key is configured) |
+| `GET` | `/v1/models/{model_id}` | Get model details (authenticated when a local API key is configured) |
 | `GET` | `/v1/auth/api-key` | Local API-key protection status |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible Chat Completions |
 | `POST` | `/v1/responses` | OpenAI-compatible Responses |
@@ -219,7 +219,8 @@ The model list is not hardcoded locally. At startup, the service reads cached ca
 The persisted `models` and `models_updated_at` fields are used only for capability discovery and scheduling and are preserved during token refresh. Actual availability remains controlled by the upstream account. Query the catalog before sending generation requests:
 
 ```bash
-curl http://localhost:8088/v1/models
+curl http://localhost:8088/v1/models \
+  -H "Authorization: Bearer local-api-key"
 ```
 
 ## Security
