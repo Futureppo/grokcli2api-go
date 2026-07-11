@@ -23,6 +23,121 @@ import (
 	"github.com/Futureppo/grokcli2api-go/internal/config"
 )
 
+// TestLiveCodexCompatibility is opt-in because it sends real generation
+// requests through an OpenAI-compatible upstream. It keeps the supplied key in
+// a temporary credential directory and never logs it or response content.
+func TestLiveCodexCompatibility(t *testing.T) {
+	if os.Getenv("GROK_LIVE_CODEX_COMPAT") != "1" {
+		t.Skip("set GROK_LIVE_CODEX_COMPAT=1 to run Codex compatibility probes")
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("GROK_LIVE_CODEX_BASE_URL")), "/")
+	key := strings.TrimSpace(os.Getenv("GROK_LIVE_CODEX_KEY"))
+	model := strings.TrimSpace(os.Getenv("GROK_LIVE_CODEX_MODEL"))
+	if baseURL == "" || key == "" || model == "" {
+		t.Fatal("GROK_LIVE_CODEX_BASE_URL, GROK_LIVE_CODEX_KEY, and GROK_LIVE_CODEX_MODEL are required")
+	}
+	dir := t.TempDir()
+	writeCredentialFileModels(t, dir, "live-codex", key, []string{model})
+	cfg := config.Config{
+		ChatProxyBaseURL: baseURL, ChatProxyVersion: "v1", AuthsDir: dir,
+		AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, ModelsRefreshInterval: 24 * time.Hour,
+		AccountMaxInflight: 2, RetryMaxAttempts: 1, RetryBaseDelay: time.Millisecond,
+		RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+		ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui",
+		ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
+	}
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := s.Handler()
+	requests := []struct {
+		name string
+		body map[string]any
+	}{
+		{
+			name: "namespace",
+			body: map[string]any{
+				"model": model, "input": "Call the provided lookup tool.", "tool_choice": "required", "max_output_tokens": 64,
+				"tools": []any{
+					map[string]any{
+						"type": "namespace", "name": "test__",
+						"tools": []any{
+							map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object", "properties": map[string]any{}}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "tool_search",
+			body: map[string]any{
+				"model": model, "input": "Search for the test tool.", "tool_choice": "required", "max_output_tokens": 64,
+				"tools": []any{
+					map[string]any{
+						"type": "namespace", "name": "test__", "description": "Test tools",
+						"tools": []any{
+							map[string]any{"type": "function", "name": "lookup", "defer_loading": true, "parameters": map[string]any{"type": "object", "properties": map[string]any{}}},
+						},
+					},
+					map[string]any{"type": "tool_search", "execution": "client", "description": "Find a tool", "parameters": map[string]any{"type": "object", "properties": map[string]any{}}},
+				},
+			},
+		},
+		{
+			name: "custom_stream",
+			body: map[string]any{
+				"model": model, "input": "Call the code tool with input hello.", "tool_choice": "required", "max_output_tokens": 64, "stream": true,
+				"tools": []any{map[string]any{"type": "custom", "name": "code", "description": "Run code"}},
+			},
+		},
+		{
+			name: "additional_tools",
+			body: map[string]any{
+				"model": model, "tool_choice": "required", "max_output_tokens": 64,
+				"input": []any{
+					map[string]any{
+						"type": "additional_tools", "role": "developer",
+						"tools": []any{map[string]any{"type": "function", "name": "loaded_tool", "parameters": map[string]any{"type": "object", "properties": map[string]any{}}}},
+					},
+					map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Call the loaded tool."}}},
+				},
+			},
+		},
+		{
+			name: "tool_search_output",
+			body: map[string]any{
+				"model": model, "tool_choice": "required", "max_output_tokens": 64,
+				"input": []any{
+					map[string]any{"type": "tool_search_call", "execution": "client", "call_id": "search_1", "arguments": map[string]any{}},
+					map[string]any{
+						"type": "tool_search_output", "execution": "client", "call_id": "search_1", "status": "completed",
+						"tools": []any{map[string]any{"type": "function", "name": "searched_tool", "defer_loading": true, "parameters": map[string]any{"type": "object", "properties": map[string]any{}}}},
+					},
+					map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Call the searched tool."}}},
+				},
+			},
+		},
+	}
+	for _, test := range requests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := json.Marshal(test.body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(payload))
+			req.Header.Set("User-Agent", "Codex Desktop/0.144.0-alpha.4")
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d", rec.Code)
+			}
+		})
+	}
+}
+
 // TestLiveGenerationLoad is opt-in because it sends real generation requests.
 // It reports only aggregate timings, statuses, usage, and process resource data.
 func TestLiveGenerationLoad(t *testing.T) {

@@ -229,6 +229,76 @@ func TestResponsesDefaultsToOpenAIFormat(t *testing.T) {
 	}
 }
 
+func TestResponsesConvertsNamespaceToolsAndRestoresCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		tools, _ := body["tools"].([]any)
+		if len(tools) != 1 {
+			t.Fatalf("tools=%#v", tools)
+		}
+		tool := tools[0].(map[string]any)
+		if tool["type"] != "function" || tool["name"] != "mcp__github__fetch" {
+			t.Fatalf("converted tool=%#v", tool)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": "resp_1", "status": "completed",
+			"output": []any{map[string]any{"type": "function_call", "name": "mcp__github__fetch", "call_id": "call_1", "arguments": `{}`}},
+		})
+	}))
+	defer upstream.Close()
+	h := newTestHandler(t, upstream.URL, nil)
+	body := `{"model":"grok-4","input":"fetch","tools":[{"type":"namespace","name":"mcp__github__","tools":[{"type":"function","name":"fetch","parameters":{"type":"object","properties":{}}}]}]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	call := response["output"].([]any)[0].(map[string]any)
+	if call["name"] != "fetch" || call["namespace"] != "mcp__github__" {
+		t.Fatalf("restored call=%#v", call)
+	}
+}
+
+func TestResponsesRejectsUnknownInputBeforeUpstream(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	h := newTestHandler(t, upstream.URL, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":[{"type":"future_item"}]}`)))
+	if rec.Code != http.StatusUnprocessableEntity || calls.Load() != 0 || !strings.Contains(rec.Body.String(), "input[0]") {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
+	}
+}
+
+func TestResponsesStreamRestoresNamespace(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"ns__lookup\",\"call_id\":\"call_1\",\"arguments\":\"\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"ns__lookup\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"name\":\"ns__lookup\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}]}}\n\n")
+	}))
+	defer upstream.Close()
+	h := newTestHandler(t, upstream.URL, nil)
+	body := `{"model":"grok-4","input":"lookup","stream":true,"tools":[{"type":"namespace","name":"ns__","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}]}]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+	text := rec.Body.String()
+	if rec.Code != http.StatusOK || strings.Contains(text, `"name":"ns__lookup"`) || !strings.Contains(text, `"name":"lookup"`) || !strings.Contains(text, `"namespace":"ns__"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, text)
+	}
+}
+
 func TestResponsesGrokBuildClientUsesNativePassThrough(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any

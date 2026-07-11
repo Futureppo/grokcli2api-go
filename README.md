@@ -5,7 +5,7 @@
 
 中文 | [English](README_EN.md)
 
-`grokcli2api-go` 是一个轻量、无第三方运行时依赖的 Go 服务，将 Grok CLI 使用的上游接口转换为 OpenAI 与 Anthropic 兼容 API。已有工具只需修改 API Base URL，即可通过常见的 SDK 或 HTTP 客户端接入。
+`grokcli2api-go` 是一个超轻量、无第三方运行时依赖的 Go 服务，将 Grok CLI 使用的上游接口转换为 OpenAI 与 Anthropic 兼容 API。已有工具只需修改 API Base URL，即可通过常见的 SDK 或 HTTP 客户端接入。
 
 > [!IMPORTANT]
 > 本项目是非官方兼容层，与 xAI、X 或 OpenAI 没有关联。请遵守相关服务条款，并自行承担使用非公开上游接口可能带来的兼容性与账号风险。

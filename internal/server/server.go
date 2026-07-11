@@ -165,9 +165,17 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "422")
 		return
 	}
-	wire := openai.PrepareResponses(body)
+	var compat *openai.ResponsesCompatibility
+	var wire map[string]any
 	if native {
 		wire = openai.PrepareNativeResponses(body)
+	} else {
+		var err error
+		wire, compat, err = openai.PrepareCompatibleResponses(body)
+		if err != nil {
+			writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "422")
+			return
+		}
 	}
 	model := openai.String(body, "model", "")
 	affinity := requestAffinity(r, body)
@@ -181,11 +189,11 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		if native {
 			writeJSON(w, http.StatusOK, payload)
 		} else {
-			writeJSON(w, http.StatusOK, openai.NormalizeResponse(payload, model))
+			writeJSON(w, http.StatusOK, compat.NormalizeResponse(payload, model))
 		}
 		return
 	}
-	s.streamResponses(w, r, wire, affinity, convID, model, native)
+	s.streamResponses(w, r, wire, affinity, convID, model, native, compat)
 }
 
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
@@ -266,7 +274,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[str
 	flush()
 }
 
-func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity, convID, model string, native bool) {
+func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity, convID, model string, native bool, compat *openai.ResponsesCompatibility) {
 	stream, err := s.client.OpenStream(r.Context(), "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 	if err != nil {
 		s.writeClientError(w, err)
@@ -291,11 +299,32 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 		if string(event.Data) == "[DONE]" && !native {
 			continue
 		}
-		if !native && event.Event == "" {
-			var data map[string]any
-			if json.Unmarshal(event.Data, &data) == nil {
-				event.Event = openai.EventType("", data)
+		if !native {
+			translated, translateErr := compat.TranslateStream(event.Event, event.Data)
+			if translateErr != nil {
+				payload, _ := json.Marshal(openai.ResponseStreamError(translateErr.Error(), "compatibility_error"))
+				_ = writeRawSSE(w, grok.SSEEvent{Event: "error", Data: payload})
+				flush()
+				return
 			}
+			for index, output := range translated {
+				translatedEvent := grok.SSEEvent{Event: output.Event, Data: output.Data}
+				if index == 0 {
+					translatedEvent.ID = event.ID
+					translatedEvent.Retry = event.Retry
+				}
+				if translatedEvent.Event == "" {
+					var data map[string]any
+					if json.Unmarshal(translatedEvent.Data, &data) == nil {
+						translatedEvent.Event = openai.EventType("", data)
+					}
+				}
+				if err := writeRawSSE(w, translatedEvent); err != nil {
+					return
+				}
+			}
+			flush()
+			continue
 		}
 		if err := writeRawSSE(w, event); err != nil {
 			return
