@@ -1,0 +1,18 @@
+# Build outputs
+/dist/
+/bin/
+*.exe
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Local configuration and secrets
+.env
+.env.local
+
+# Editor / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

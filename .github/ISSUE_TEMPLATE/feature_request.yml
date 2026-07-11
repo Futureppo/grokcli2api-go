@@ -1,0 +1,46 @@
+name: Feature Request
+description: Suggest an API compatibility, usability, or operational improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve grokcli2api-go. Please explain the use case before proposing an implementation.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What problem would this feature solve, and who would benefit from it?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior or interface you would like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any workarounds or alternative designs you considered.
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Protocol compatibility impact
+      description: Note any OpenAI, Anthropic, or Grok wire-format implications.
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add examples, screenshots, links, or other supporting information.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched the existing issues and discussions for similar requests.
+          required: true
+        - label: This request describes one focused feature or improvement.
+          required: true

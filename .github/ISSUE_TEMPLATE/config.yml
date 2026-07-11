@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a Security Vulnerability
+    url: https://github.com/Futureppo/grokcli2api-go/security/advisories/new
+    about: Report security vulnerabilities privately. Do not disclose them in a public issue.

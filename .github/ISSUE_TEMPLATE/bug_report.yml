@@ -1,0 +1,104 @@
+name: Bug Report
+description: Report a reproducible problem or unexpected behavior
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+        Before submitting, search existing issues and remove all session tokens, API keys, personal data, and complete authentication files from your report.
+  - type: input
+    id: version
+    attributes:
+      label: Project version
+      description: Provide a release version or commit SHA.
+      placeholder: v0.3.0 or abc1234
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Prebuilt binary
+        - Built from source
+        - Docker
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include your operating system, architecture, and Go version when relevant.
+      placeholder: Windows 11, amd64, Go 1.23.4
+    validations:
+      required: true
+  - type: dropdown
+    id: endpoint
+    attributes:
+      label: Affected endpoint or component
+      options:
+        - /v1/chat/completions
+        - /v1/responses
+        - /v1/messages
+        - /v1/models
+        - Authentication
+        - Proxy or networking
+        - Docker
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem description
+      description: Clearly describe what went wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest request or sequence of steps that reliably reproduces the problem.
+      placeholder: |
+        1. Configure ...
+        2. Send ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Paste relevant logs after removing credentials and personal data.
+      render: shell
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add any other information, screenshots, or related issue links.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched the existing issues for duplicates.
+          required: true
+        - label: I removed all credentials and sensitive information from this report.
+          required: true
