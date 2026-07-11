@@ -74,6 +74,16 @@ go run ./cmd/grok2api
 
 ### 使用 Docker
 
+直接从 GitHub Container Registry 拉取最新镜像：
+
+```bash
+docker pull ghcr.io/futureppo/grokcli2api-go:latest
+docker run --rm -p 8088:8088 --env-file .env \
+  ghcr.io/futureppo/grokcli2api-go:latest
+```
+
+也可以在本地构建：
+
 ```bash
 docker build -t grokcli2api-go .
 docker run --rm -p 8088:8088 --env-file .env grokcli2api-go
@@ -85,8 +95,10 @@ docker run --rm -p 8088:8088 --env-file .env grokcli2api-go
 docker run --rm -p 8088:8088 \
   -v "$HOME/.grok:/home/app/.grok:ro" \
   -e GROK_AUTH_FILE=/home/app/.grok/auth.json \
-  grokcli2api-go
+  ghcr.io/futureppo/grokcli2api-go:latest
 ```
+
+每次推送都会发布 `sha-<commit>` 和对应的分支标签；`main` 分支还会更新 `latest` 标签。
 
 ## 调用示例
 
@@ -218,4 +230,3 @@ go build ./cmd/grok2api
 ```
 
 提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。Bug 和功能建议可通过 [GitHub Issues](https://github.com/Futureppo/grokcli2api-go/issues) 提交。
-

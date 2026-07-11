@@ -74,6 +74,16 @@ The service listens on `http://0.0.0.0:8088` by default. Open `http://localhost:
 
 ### Run with Docker
 
+Pull the latest image directly from GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/futureppo/grokcli2api-go:latest
+docker run --rm -p 8088:8088 --env-file .env \
+  ghcr.io/futureppo/grokcli2api-go:latest
+```
+
+Alternatively, build the image locally:
+
 ```bash
 docker build -t grokcli2api-go .
 docker run --rm -p 8088:8088 --env-file .env grokcli2api-go
@@ -85,8 +95,10 @@ When using an authentication file, mount it and use its path inside the containe
 docker run --rm -p 8088:8088 \
   -v "$HOME/.grok:/home/app/.grok:ro" \
   -e GROK_AUTH_FILE=/home/app/.grok/auth.json \
-  grokcli2api-go
+  ghcr.io/futureppo/grokcli2api-go:latest
 ```
+
+Every push publishes a `sha-<commit>` tag and a matching branch tag. Pushes to `main` also update `latest`.
 
 ## Usage examples
 
@@ -218,4 +230,3 @@ go build ./cmd/grok2api
 ```
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes. Report bugs and feature requests through [GitHub Issues](https://github.com/Futureppo/grokcli2api-go/issues).
-
