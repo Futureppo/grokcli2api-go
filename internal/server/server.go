@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ func New(cfg config.Config) (*Server, error) {
 		ReloadInterval: cfg.AuthsReloadInterval, RefreshConcurrency: cfg.AuthRefreshConcurrency,
 		AccountMaxInflight: cfg.AccountMaxInflight,
 		AffinityTTL:        cfg.AffinityTTL, AffinityMaxEntries: cfg.AffinityMaxEntries,
+		AllowEmpty: cfg.AdminKey != "",
 	}, httpClient)
 	if err != nil {
 		return nil, err
@@ -47,14 +49,20 @@ func New(cfg config.Config) (*Server, error) {
 		pool.Close()
 		return nil, err
 	}
-	modelCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	err = client.InitializeModels(modelCtx)
-	cancel()
-	if err != nil {
-		client.Close()
-		pool.Close()
-		return nil, fmt.Errorf("initialize model catalog: %w", err)
+	if len(pool.AccountIDs()) > 0 {
+		modelCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		err = client.InitializeModels(modelCtx)
+		cancel()
+		if err != nil && cfg.AdminKey == "" {
+			client.Close()
+			pool.Close()
+			return nil, fmt.Errorf("initialize model catalog: %w", err)
+		}
+		if err != nil {
+			slog.Warn("initial model discovery failed; administrator API remains available", "error", err)
+		}
 	}
+	client.StartModelRefresh()
 	s := &Server{cfg: cfg, pool: pool, client: client, mux: http.NewServeMux()}
 	s.routes()
 	return s, nil
@@ -83,6 +91,11 @@ func (s *Server) routes() {
 	s.protected("GET /v1/grok/mcp/configs", s.proxyGET("mcp/configs", false))
 	s.protected("GET /v1/grok/mcp/tools/list", s.proxyGET("mcp/tools/list", false))
 	s.protected("GET /v1/grok/feedback/config", s.proxyGET("feedback/config", true))
+	if s.cfg.AdminKey != "" {
+		s.mux.Handle("GET /v1/admin/credentials", s.adminKeyGate(http.HandlerFunc(s.adminCredentials)))
+		s.mux.Handle("POST /v1/admin/credentials", s.adminKeyGate(http.HandlerFunc(s.adminCredentials)))
+		s.mux.Handle("DELETE /v1/admin/credentials/{id}", s.adminKeyGate(http.HandlerFunc(s.adminCredential)))
+	}
 }
 
 func (s *Server) protected(pattern string, handler http.HandlerFunc) {
@@ -128,6 +141,133 @@ func (s *Server) model(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiKeyStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"enabled": len(s.cfg.APIKeys) > 0, "key_count": len(s.cfg.APIKeys)})
+}
+
+const (
+	maxCredentialSize  = 1 << 20
+	maxMultipartUpload = maxCredentialSize + 64<<10
+)
+
+func (s *Server) adminCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": s.pool.Credentials()})
+		return
+	}
+	raw, status, err := readCredentialUpload(w, r)
+	if err != nil {
+		writeError(w, status, err.Error(), "invalid_request_error", http.StatusText(status))
+		return
+	}
+	info, created, err := s.pool.ImportCredential(r.Context(), raw)
+	if err != nil {
+		switch {
+		case errors.Is(err, auth.ErrInvalidCredentialJSON):
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_json")
+		case errors.Is(err, auth.ErrInvalidCredential):
+			writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "invalid_credential")
+		default:
+			writeError(w, http.StatusInternalServerError, "credential could not be saved", "server_error", "credential_write_failed")
+		}
+		return
+	}
+
+	discovery := "succeeded"
+	response := map[string]any{"credential": info, "created": created}
+	probeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	probeErr := s.client.RefreshAccountModels(probeCtx, info.ID)
+	cancel()
+	if current, ok := s.pool.Credential(info.ID); ok {
+		response["credential"] = current
+	}
+	if probeErr != nil {
+		discovery = "failed"
+		response["warning"] = "model discovery failed; credential remains saved"
+	}
+	response["model_discovery"] = discovery
+	status = http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	slog.Info("credential uploaded", "account", info.ID, "created", created, "model_discovery", discovery)
+	writeJSON(w, status, response)
+}
+
+func (s *Server) adminCredential(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if !validCredentialID(id) {
+		writeError(w, http.StatusNotFound, "credential not found", "invalid_request_error", "credential_not_found")
+		return
+	}
+	if err := s.pool.DeleteCredential(r.Context(), id); err != nil {
+		if errors.Is(err, auth.ErrCredentialNotFound) {
+			writeError(w, http.StatusNotFound, "credential not found", "invalid_request_error", "credential_not_found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "credential could not be deleted", "server_error", "credential_delete_failed")
+		return
+	}
+	slog.Info("credential deleted", "account", id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func readCredentialUpload(w http.ResponseWriter, r *http.Request) ([]byte, int, error) {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return nil, http.StatusUnsupportedMediaType, errors.New("Content-Type must be application/json or multipart/form-data")
+	}
+	switch mediaType {
+	case "application/json":
+		r.Body = http.MaxBytesReader(w, r.Body, maxCredentialSize)
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(readErr, &tooLarge) {
+				return nil, http.StatusRequestEntityTooLarge, errors.New("credential exceeds 1 MiB")
+			}
+			return nil, http.StatusBadRequest, errors.New("credential body could not be read")
+		}
+		return body, 0, nil
+	case "multipart/form-data":
+		r.Body = http.MaxBytesReader(w, r.Body, maxMultipartUpload)
+		if err := r.ParseMultipartForm(maxCredentialSize); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				return nil, http.StatusRequestEntityTooLarge, errors.New("credential upload exceeds the size limit")
+			}
+			return nil, http.StatusBadRequest, errors.New("invalid multipart upload")
+		}
+		if r.MultipartForm == nil {
+			return nil, http.StatusBadRequest, errors.New("invalid multipart upload")
+		}
+		defer r.MultipartForm.RemoveAll()
+		files := r.MultipartForm.File["file"]
+		if len(files) != 1 {
+			return nil, http.StatusBadRequest, errors.New("multipart upload must contain exactly one file field")
+		}
+		file, err := files[0].Open()
+		if err != nil {
+			return nil, http.StatusBadRequest, errors.New("credential file could not be opened")
+		}
+		defer file.Close()
+		body, err := io.ReadAll(io.LimitReader(file, maxCredentialSize+1))
+		if err != nil {
+			return nil, http.StatusBadRequest, errors.New("credential file could not be read")
+		}
+		if len(body) > maxCredentialSize {
+			return nil, http.StatusRequestEntityTooLarge, errors.New("credential exceeds 1 MiB")
+		}
+		return body, 0, nil
+	default:
+		return nil, http.StatusUnsupportedMediaType, errors.New("Content-Type must be application/json or multipart/form-data")
+	}
+}
+
+func validCredentialID(id string) bool {
+	if len(id) != 24 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil && id == strings.ToLower(id)
 }
 
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
@@ -440,6 +580,25 @@ func (s *Server) apiKeyGate(next http.Handler) http.Handler {
 			} else {
 				writeError(w, http.StatusUnauthorized, "invalid or missing API key", "invalid_request_error", "invalid_api_key")
 			}
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) adminKeyGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		candidate := ""
+		if authz := r.Header.Get("Authorization"); len(authz) >= 7 && strings.EqualFold(authz[:7], "Bearer ") {
+			candidate = strings.TrimSpace(authz[7:])
+		}
+		if value := strings.TrimSpace(r.Header.Get("X-Admin-Key")); value != "" {
+			candidate = value
+		}
+		if constantEqual(candidate, s.cfg.AdminKey) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeError(w, http.StatusUnauthorized, "invalid or missing administrator key", "authentication_error", "invalid_admin_key")
 			return
 		}
 		next.ServeHTTP(w, r)

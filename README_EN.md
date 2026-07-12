@@ -265,12 +265,32 @@ The service loads environment variables that are not already set from a `.env` f
 | `GROK2API_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARN`, or `ERROR` |
 | `GROK_API_KEYS` | empty | Comma-separated local access keys; separate keys may be assigned to different clients |
 | `GROK_API_KEY` | empty | Backward-compatible alias for one local access key |
+| `GROK_ADMIN_KEY` | empty | Independent administrator key; enables remote credential management and empty-pool startup |
 
 When local access protection is enabled, protected endpoints accept any of these headers:
 
 - `Authorization: Bearer <key>`
 - `x-api-key: <key>`
 - `api-key: <key>`
+
+The administrator key is independent from normal API keys. Management endpoints accept `Authorization: Bearer <admin-key>` or `X-Admin-Key: <admin-key>` and should only be exposed through HTTPS on a restricted network. Upload a credential as a JSON request body:
+
+```bash
+curl http://localhost:8088/v1/admin/credentials \
+  -H "Authorization: Bearer $GROK_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @auth.json
+```
+
+Or upload it as a file form:
+
+```bash
+curl http://localhost:8088/v1/admin/credentials \
+  -H "X-Admin-Key: $GROK_ADMIN_KEY" \
+  -F "file=@auth.json;type=application/json"
+```
+
+The server derives a redacted ID from the credential's stable account identity. Uploading the same account again atomically replaces its existing credential. Model discovery runs immediately after upload; a temporary discovery failure does not remove the saved credential.
 
 ### Credential Pool and Scheduling
 
@@ -326,6 +346,16 @@ go run ./cmd/grok2api -version
 
 “Optional” means authentication is required only when a local API key has been configured.
 
+### Administrator Credential APIs
+
+These endpoints are registered only when `GROK_ADMIN_KEY` is set, and normal API keys cannot access them. List responses never expose account subjects, file paths, client IDs, or tokens.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/v1/admin/credentials` | List redacted credential status and model catalogs |
+| `POST` | `/v1/admin/credentials` | Upload or replace a JSON credential using a JSON body or multipart `file` field |
+| `DELETE` | `/v1/admin/credentials/{id}` | Delete a credential and immediately remove it from scheduling |
+
 ### Read-only Grok Passthrough APIs
 
 | Method | Path |
@@ -351,6 +381,7 @@ Local `.env` and `auths/` data remain external configuration and credential stor
 
 - Never commit or disclose OAuth tokens, API keys, authentication files, or unsanitized logs.
 - Configure `GROK_API_KEYS` before exposing the service to a network, and enable HTTPS, access control, and rate limiting at the reverse proxy.
+- When enabling `GROK_ADMIN_KEY`, use a separate strong random key and apply additional source-address and rate restrictions to the management endpoints.
 - Apply least-privilege file permissions to the credential directory and restrict which system users can access it.
 - Do not enable `GROK_TLS_INSECURE_SKIP_VERIFY` outside a controlled debugging environment.
 - Do not use session IDs, email addresses, or other sensitive data directly as affinity identifiers.

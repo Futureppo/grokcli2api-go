@@ -2,10 +2,12 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -951,6 +953,153 @@ func TestPublicRoutesBypassGate(t *testing.T) {
 	}
 }
 
+func TestAdminCredentialLifecycle(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("upstream path = %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": []any{map[string]any{"id": "grok-4"}}})
+	}))
+	defer upstream.Close()
+	s := newAdminTestServer(t, upstream.URL)
+	defer s.Close()
+	h := s.Handler()
+
+	payload := adminCredentialPayload(t, "remote-subject", "token-secret")
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/credentials", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin-Key", "admin-secret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q", rec.Header().Get("Cache-Control"))
+	}
+	var created struct {
+		Credential auth.CredentialInfo `json:"credential"`
+		Created    bool                `json:"created"`
+		Discovery  string              `json:"model_discovery"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if !created.Created || created.Discovery != "succeeded" || created.Credential.Status != "ready" || created.Credential.ID == "" {
+		t.Fatalf("create response = %#v", created)
+	}
+
+	unauthorized := httptest.NewRequest(http.MethodGet, "/v1/admin/credentials", nil)
+	unauthorized.Header.Set("Authorization", "Bearer client-key")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, unauthorized)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("ordinary key status = %d", rec.Code)
+	}
+	adminOnClientAPI := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	adminOnClientAPI.Header.Set("Authorization", "Bearer admin-secret")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, adminOnClientAPI)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("administrator key on client API status = %d", rec.Code)
+	}
+
+	list := httptest.NewRequest(http.MethodGet, "/v1/admin/credentials", nil)
+	list.Header.Set("Authorization", "Bearer admin-secret")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, list)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, secret := range []string{"remote-subject", "token-secret", "refresh-secret", "client-secret"} {
+		if strings.Contains(rec.Body.String(), secret) {
+			t.Fatalf("list leaked %q: %s", secret, rec.Body.String())
+		}
+	}
+
+	var multipartBody bytes.Buffer
+	writer := multipart.NewWriter(&multipartBody)
+	part, err := writer.CreateFormFile("file", "../../ignored.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(adminCredentialPayload(t, "remote-subject", "token-replaced")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/v1/admin/credentials", &multipartBody)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer admin-secret")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"created":false`) {
+		t.Fatalf("replace status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/v1/admin/credentials/"+created.Credential.ID, nil)
+	deleteReq.Header.Set("X-Admin-Key", "admin-secret")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, deleteReq)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	inference := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"hello"}`))
+	inference.Header.Set("Authorization", "Bearer client-key")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, inference)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("empty-pool inference status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminCredentialUploadValidation(t *testing.T) {
+	s := newAdminTestServer(t, "http://127.0.0.1:1")
+	defer s.Close()
+	h := s.Handler()
+	request := func(contentType string, body io.Reader) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/admin/credentials", body)
+		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("X-Admin-Key", "admin-secret")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := request("text/plain", strings.NewReader("{}")); rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("media type status = %d", rec.Code)
+	}
+	if rec := request("application/json", strings.NewReader(`{"access_token":`)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid JSON status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := request("application/json", strings.NewReader(`{"access_token":"token"}`)); rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid credential status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := request("application/json", bytes.NewReader(make([]byte, maxCredentialSize+1))); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminUploadKeepsCredentialWhenDiscoveryFails(t *testing.T) {
+	s := newAdminTestServer(t, "http://127.0.0.1:1")
+	defer s.Close()
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/credentials", bytes.NewReader(adminCredentialPayload(t, "offline-subject", "offline-token")))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin-Key", "admin-secret")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated || !strings.Contains(rec.Body.String(), `"model_discovery":"failed"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	credentials := s.pool.Credentials()
+	if len(credentials) != 1 || credentials[0].Status != "pending_models" {
+		t.Fatalf("persisted credentials = %#v", credentials)
+	}
+}
+
 func TestModelRoutesRequireAPIKey(t *testing.T) {
 	h := newTestHandler(t, "http://127.0.0.1:1", []string{"key"})
 	for _, path := range []string{"/v1/models", "/v1/models/grok-4"} {
@@ -1012,7 +1161,7 @@ func TestModelsEndpointAggregatesCredentialCatalogs(t *testing.T) {
 
 func TestRemovedRoutesAre404(t *testing.T) {
 	h := newTestHandler(t, "http://127.0.0.1:1", nil)
-	for _, path := range []string{"/docs", "/openapi.json", "/v1/health", "/v1/auth/status"} {
+	for _, path := range []string{"/docs", "/openapi.json", "/v1/health", "/v1/auth/status", "/v1/admin/credentials"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusNotFound {
@@ -1074,6 +1223,37 @@ func BenchmarkModelsEndpoint(b *testing.B) {
 
 func newTestHandler(t *testing.T, upstream string, keys []string) http.Handler {
 	return newTestHandlerWithTokens(t, upstream, keys, []string{"upstream-token"})
+}
+
+func newAdminTestServer(t *testing.T, upstream string) *Server {
+	t.Helper()
+	cfg := config.Config{
+		ChatProxyBaseURL: upstream, ChatProxyVersion: "v1", AuthsDir: filepath.Join(t.TempDir(), "auths"),
+		AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, AccountMaxInflight: 2,
+		ModelsRefreshInterval: 6 * time.Hour, RetryMaxAttempts: 1, RetryBaseDelay: time.Millisecond,
+		RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+		ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui",
+		ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli", StreamCompression: "identity",
+		APIKeys: []string{"client-key"}, AdminKey: "admin-secret",
+	}
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func adminCredentialPayload(t *testing.T, subject, token string) []byte {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"access_token": token, "refresh_token": "refresh-secret", "client_id": "client-secret",
+		"sub": subject, "expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
 }
 
 func newTestHandlerWithTokens(t *testing.T, upstream string, keys, tokens []string) http.Handler {

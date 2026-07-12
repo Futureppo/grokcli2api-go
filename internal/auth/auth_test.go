@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -710,6 +711,161 @@ func TestHotReloadAddsAndRemovesCredentials(t *testing.T) {
 	if len(pool.accounts) != 1 {
 		t.Fatalf("account count after remove = %d", len(pool.accounts))
 	}
+}
+
+func TestPoolAllowEmptyImportReplaceAndDelete(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := NewPool(context.Background(), PoolConfig{Dir: dir}, nil); !errors.Is(err, ErrNoAuth) {
+		t.Fatalf("NewPool without AllowEmpty error = %v, want ErrNoAuth", err)
+	}
+	pool, err := NewPool(context.Background(), PoolConfig{
+		Dir: dir, Surface: "tui", AllowEmpty: true, ReloadInterval: time.Hour,
+		RefreshConcurrency: 1, AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+	}, &http.Client{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	first := remoteCredentialJSON(t, "remote-subject", "token-old", []string{"grok-4"})
+	info, created, err := pool.ImportCredential(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || info.Status != "ready" || !info.Usable || info.ID == "" {
+		t.Fatalf("first import = %#v, created=%v", info, created)
+	}
+	if len(pool.Credentials()) != 1 {
+		t.Fatalf("credential count = %d", len(pool.Credentials()))
+	}
+	path := filepath.Join(dir, info.ID+".json")
+	if stat, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if os.PathSeparator != '\\' && stat.Mode().Perm() != 0o600 {
+		t.Fatalf("credential mode = %o", stat.Mode().Perm())
+	}
+
+	replacement := remoteCredentialJSON(t, "remote-subject", "token-new", []string{"grok-4", "grok-new"})
+	updated, created, err := pool.ImportCredential(context.Background(), replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || updated.ID != info.ID || !slices.Equal(updated.Models, []string{"grok-4", "grok-new"}) {
+		t.Fatalf("replacement = %#v, created=%v", updated, created)
+	}
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(stored), "token-new") || strings.Contains(string(stored), "token-old") {
+		t.Fatal("replacement was not persisted")
+	}
+
+	if err := pool.DeleteCredential(context.Background(), info.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(pool.Credentials()) != 0 {
+		t.Fatalf("credential count after delete = %d", len(pool.Credentials()))
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("credential file still exists: %v", err)
+	}
+	if _, err := pool.Acquire(context.Background(), Affinity{}, "grok-4", nil); err == nil {
+		t.Fatal("empty pool Acquire unexpectedly succeeded")
+	} else {
+		var unavailable *UnavailableError
+		if !errors.As(err, &unavailable) {
+			t.Fatalf("empty pool Acquire error = %T %v", err, err)
+		}
+	}
+}
+
+func TestImportCredentialValidation(t *testing.T) {
+	pool, err := NewPool(context.Background(), PoolConfig{Dir: t.TempDir(), AllowEmpty: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, _, err := pool.ImportCredential(context.Background(), []byte(`{"access_token":`)); !errors.Is(err, ErrInvalidCredentialJSON) {
+		t.Fatalf("invalid JSON error = %v", err)
+	}
+	if _, _, err := pool.ImportCredential(context.Background(), []byte(`{"access_token":"token"}`)); !errors.Is(err, ErrInvalidCredential) {
+		t.Fatalf("missing subject error = %v", err)
+	}
+}
+
+func TestImportWaitsForRefreshAndWins(t *testing.T) {
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(refreshStarted)
+		<-releaseRefresh
+		_, _ = io.WriteString(w, `{"access_token":"token-refreshed","refresh_token":"refresh-new","expires_in":3600}`)
+	}))
+	defer server.Close()
+	pool, err := NewPool(context.Background(), PoolConfig{
+		Dir: t.TempDir(), Surface: "tui", AllowEmpty: true, ReloadInterval: time.Hour,
+		RefreshConcurrency: 1, AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+	}, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	initial, err := json.Marshal(map[string]any{
+		"access_token": "token-old", "refresh_token": "refresh-old", "client_id": "client",
+		"sub": "refresh-race", "expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		"token_endpoint": server.URL, "models": []string{"grok-4"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, _, err := pool.ImportCredential(context.Background(), initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- pool.Refresh(context.Background(), info.ID) }()
+	<-refreshStarted
+	replacement := remoteCredentialJSON(t, "refresh-race", "token-uploaded", []string{"grok-4"})
+	importDone := make(chan error, 1)
+	go func() {
+		_, _, err := pool.ImportCredential(context.Background(), replacement)
+		importDone <- err
+	}()
+	select {
+	case err := <-importDone:
+		t.Fatalf("import completed before refresh lock was released: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseRefresh)
+	if err := <-refreshDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-importDone; err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(pool.cfg.Dir, info.ID+".json")
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(stored), "token-uploaded") || strings.Contains(string(stored), "token-refreshed") {
+		t.Fatalf("upload did not win refresh race: %s", stored)
+	}
+}
+
+func remoteCredentialJSON(t *testing.T, subject, token string, models []string) []byte {
+	t.Helper()
+	raw := map[string]any{
+		"access_token": token, "refresh_token": "refresh", "client_id": "client",
+		"sub": subject, "expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		"models": models, "models_updated_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func BenchmarkPoolAcquireTenThousandAccounts(b *testing.B) {

@@ -225,11 +225,30 @@ func (c *Client) InitializeModels(ctx context.Context) error {
 	if len(c.pool.Models()) == 0 {
 		return errors.New("no models discovered from credential accounts")
 	}
+	c.StartModelRefresh()
+	return nil
+}
+
+// StartModelRefresh starts the periodic model discovery loop even when the
+// credential pool is initially empty and will be bootstrapped through the
+// administrator API.
+func (c *Client) StartModelRefresh() {
 	c.modelStart.Do(func() {
 		c.modelWG.Add(1)
 		go c.modelRefreshLoop()
 	})
-	return nil
+}
+
+// RefreshAccountModels immediately discovers and persists one account's model
+// catalog. Credential writes are serialized by the pool; avoiding the batch
+// refresh mutex here keeps the caller's context deadline authoritative.
+func (c *Client) RefreshAccountModels(ctx context.Context, accountID string) error {
+	models, err := c.fetchAccountModels(ctx, accountID, false)
+	if err == nil {
+		err = c.pool.UpdateModels(accountID, models, time.Now())
+	}
+	c.pool.RebuildSchedulingSnapshot()
+	return err
 }
 
 func (c *Client) RefreshModels(ctx context.Context, force bool) error {

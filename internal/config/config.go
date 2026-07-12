@@ -39,6 +39,7 @@ type Config struct {
 	ProxyURL               string
 	NoProxy                []string
 	APIKeys                []string
+	AdminKey               string
 }
 
 func Load() (Config, error) {
@@ -119,6 +120,7 @@ func Load() (Config, error) {
 		StreamCompression:      streamCompression,
 		ProxyURL:               strings.TrimSpace(os.Getenv("GROK_PROXY_URL")),
 		NoProxy:                splitCSV(os.Getenv("GROK_NO_PROXY")),
+		AdminKey:               strings.TrimSpace(os.Getenv("GROK_ADMIN_KEY")),
 	}
 	cfg.APIKeys = unique(append(splitCSV(os.Getenv("GROK_API_KEYS")), splitCSV(os.Getenv("GROK_API_KEY"))...))
 	return cfg, nil

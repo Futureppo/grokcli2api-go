@@ -265,12 +265,32 @@ X-Grok-Session-ID: conversation-123
 | `GROK2API_LOG_LEVEL` | `INFO` | 日志等级：`DEBUG`、`INFO`、`WARN` 或 `ERROR` |
 | `GROK_API_KEYS` | 空 | 逗号分隔的本地访问密钥，可为不同客户端分配独立 Key |
 | `GROK_API_KEY` | 空 | 单个本地访问密钥的兼容别名 |
+| `GROK_ADMIN_KEY` | 空 | 独立的管理员密钥；设置后启用远程凭证管理并允许空凭证池启动 |
 
 启用本地访问保护后，受保护接口接受以下任一种请求头：
 
 - `Authorization: Bearer <key>`
 - `x-api-key: <key>`
 - `api-key: <key>`
+
+管理员密钥与普通 API Key 相互独立。管理接口接受 `Authorization: Bearer <admin-key>` 或 `X-Admin-Key: <admin-key>`，且只应通过 HTTPS 和受限网络暴露。上传凭证可以直接发送 JSON：
+
+```bash
+curl http://localhost:8088/v1/admin/credentials \
+  -H "Authorization: Bearer $GROK_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @auth.json
+```
+
+也可以使用文件表单：
+
+```bash
+curl http://localhost:8088/v1/admin/credentials \
+  -H "X-Admin-Key: $GROK_ADMIN_KEY" \
+  -F "file=@auth.json;type=application/json"
+```
+
+服务端根据凭证中的稳定账号标识生成脱敏 ID；重复上传同一账号会原子覆盖原凭证。上传后会立即尝试发现模型，临时探测失败不会删除已经保存的凭证。
 
 ### 凭证池与调度
 
@@ -326,6 +346,16 @@ go run ./cmd/grok2api -version
 
 “可选”表示仅在配置了本地 API Key 时需要鉴权。
 
+### 管理员凭证接口
+
+仅在设置 `GROK_ADMIN_KEY` 后启用，普通 API Key 无法访问。列表响应不会包含账号标识、文件路径、客户端 ID 或 Token。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/v1/admin/credentials` | 列出脱敏的凭证状态和模型目录 |
+| `POST` | `/v1/admin/credentials` | 上传或覆盖 JSON 凭证，支持 JSON 请求体和 multipart `file` 字段 |
+| `DELETE` | `/v1/admin/credentials/{id}` | 删除凭证并立即从调度池移除 |
+
 ### Grok 只读透传接口
 
 | 方法 | 路径 |
@@ -351,6 +381,7 @@ go run ./cmd/grok2api -version
 
 - 切勿提交或公开 OAuth Token、API Key、认证文件及未脱敏日志。
 - 对外提供服务前，务必配置 `GROK_API_KEYS`，并在反向代理层启用 HTTPS、访问控制和限流。
+- 启用 `GROK_ADMIN_KEY` 时应使用独立的强随机密钥，并额外限制管理接口的来源地址和请求频率。
 - 为凭证目录设置最小必要文件权限，并限制可访问该目录的系统用户。
 - 除非处于受控调试环境，否则不要启用 `GROK_TLS_INSECURE_SKIP_VERIFY`。
 - 不要把会话 ID、用户邮箱或其他敏感数据直接用作亲和标识。

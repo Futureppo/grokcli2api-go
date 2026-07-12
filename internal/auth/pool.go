@@ -22,6 +22,8 @@ const stateFileName = ".grokcli2api-state.json"
 
 var errAccountBusy = errors.New("credential account is at its in-flight limit")
 
+var ErrCredentialNotFound = errors.New("credential not found")
+
 type AffinityMode uint8
 
 const (
@@ -43,6 +45,20 @@ type PoolConfig struct {
 	AccountMaxInflight int
 	AffinityTTL        time.Duration
 	AffinityMaxEntries int
+	AllowEmpty         bool
+}
+
+// CredentialInfo is a redacted view of a credential account. It deliberately
+// excludes subjects, file paths, client IDs, and token values.
+type CredentialInfo struct {
+	ID              string     `json:"id"`
+	Status          string     `json:"status"`
+	Usable          bool       `json:"usable"`
+	Disabled        bool       `json:"disabled"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+	CooldownUntil   *time.Time `json:"cooldown_until,omitempty"`
+	Models          []string   `json:"models"`
+	HasRefreshToken bool       `json:"has_refresh_token"`
 }
 
 type UnavailableError struct {
@@ -182,6 +198,7 @@ type Pool struct {
 	closeOnce     sync.Once
 	wg            sync.WaitGroup
 	stateMu       sync.Mutex
+	mutationMu    sync.Mutex
 }
 
 type Lease struct {
@@ -242,6 +259,11 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 	if client == nil {
 		client = &http.Client{Timeout: 20 * time.Second}
 	}
+	if cfg.AllowEmpty {
+		if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+			return nil, fmt.Errorf("create auths directory: %w", err)
+		}
+	}
 	p := &Pool{
 		cfg: cfg, http: client, accounts: map[string]*account{}, files: map[string]fileEntry{},
 		states: map[string]accountState{}, affinity: newAffinityCache(cfg.AffinityTTL, cfg.AffinityMaxEntries),
@@ -254,10 +276,10 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 	if err := p.scan(); err != nil {
 		return nil, err
 	}
-	if len(p.accounts) == 0 {
+	if len(p.accounts) == 0 && !cfg.AllowEmpty {
 		return nil, ErrNoAuth
 	}
-	if !p.hasReadyAccount() {
+	if len(p.accounts) > 0 && !p.hasReadyAccount() {
 		warmup, cancel := context.WithTimeout(ctx, 30*time.Second)
 		err := p.warmup(warmup)
 		cancel()
@@ -312,6 +334,9 @@ func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exc
 			p.rebuildActive()
 			active = p.schedulingSnapshot(model)
 			if len(active) == 0 {
+				if !p.hasAccounts() {
+					return nil, p.unavailable(model)
+				}
 				if model != "" && !p.hasKnownModel(model) {
 					return nil, &ModelUnavailableError{Model: model}
 				}
@@ -368,11 +393,21 @@ func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exc
 			}
 			continue
 		}
+		if !p.hasAccounts() {
+			return nil, p.unavailable(model)
+		}
 		if model != "" && !p.hasKnownModel(model) {
 			return nil, &ModelUnavailableError{Model: model}
 		}
 		return nil, p.unavailable(model)
 	}
+}
+
+func (p *Pool) hasAccounts() bool {
+	p.mu.RLock()
+	hasAccounts := len(p.accounts) > 0
+	p.mu.RUnlock()
+	return hasAccounts
 }
 
 func (p *Pool) accountRequestUsable(id string) bool {
@@ -512,6 +547,161 @@ func (p *Pool) AccountIDs() []string {
 	p.mu.RUnlock()
 	sort.Strings(ids)
 	return ids
+}
+
+// Credentials returns redacted credential metadata sorted by account ID.
+func (p *Pool) Credentials() []CredentialInfo {
+	p.mu.RLock()
+	items := make([]CredentialInfo, 0, len(p.accounts))
+	for id, a := range p.accounts {
+		items = append(items, credentialInfo(id, a, time.Now()))
+	}
+	p.mu.RUnlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	return items
+}
+
+// Credential returns redacted metadata for one account.
+func (p *Pool) Credential(id string) (CredentialInfo, bool) {
+	p.mu.RLock()
+	a := p.accounts[id]
+	if a == nil {
+		p.mu.RUnlock()
+		return CredentialInfo{}, false
+	}
+	info := credentialInfo(id, a, time.Now())
+	p.mu.RUnlock()
+	return info, true
+}
+
+func credentialInfo(id string, a *account, now time.Time) CredentialInfo {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	info := CredentialInfo{ID: id, Disabled: a.disabled, Models: []string{}}
+	if a.credential == nil {
+		info.Status = "unavailable"
+		return info
+	}
+	info.Models = append(info.Models, a.credential.Models...)
+	info.HasRefreshToken = a.credential.RefreshToken != ""
+	if !a.credential.ExpiresAt.IsZero() {
+		expires := a.credential.ExpiresAt.UTC()
+		info.ExpiresAt = &expires
+	}
+	if now.Before(a.cooldownUntil) {
+		cooldown := a.cooldownUntil.UTC()
+		info.CooldownUntil = &cooldown
+	}
+	info.Usable = !a.disabled && !now.Before(a.cooldownUntil) && a.credential.usable(now)
+	switch {
+	case a.disabled:
+		info.Status = "disabled"
+	case now.Before(a.cooldownUntil):
+		info.Status = "cooling_down"
+	case !a.credential.usable(now):
+		info.Status = "needs_refresh"
+	case len(a.credential.Models) == 0:
+		info.Status = "pending_models"
+	default:
+		info.Status = "ready"
+	}
+	return info
+}
+
+// ImportCredential validates and atomically creates or replaces a credential.
+// Account identity, rather than a caller-supplied filename, determines the
+// destination so remote uploads cannot escape the configured directory.
+func (p *Pool) ImportCredential(ctx context.Context, raw []byte) (CredentialInfo, bool, error) {
+	parsed, err := parseCredential(raw, "", p.cfg.Surface)
+	if err != nil {
+		return CredentialInfo{}, false, err
+	}
+	id := accountID(parsed.Subject)
+	p.mutationMu.Lock()
+	defer p.mutationMu.Unlock()
+
+	p.mu.RLock()
+	existing := p.accounts[id]
+	p.mu.RUnlock()
+	created := existing == nil
+	path := filepath.Join(p.cfg.Dir, id+".json")
+	if existing != nil {
+		if err := existing.acquireRefresh(ctx); err != nil {
+			return CredentialInfo{}, false, err
+		}
+		defer existing.releaseRefresh()
+		existing.mu.RLock()
+		if existing.credential != nil && existing.credential.Path != "" {
+			path = existing.credential.Path
+		}
+		existing.mu.RUnlock()
+	}
+
+	if _, statErr := os.Stat(path); statErr != nil && !os.IsNotExist(statErr) {
+		return CredentialInfo{}, false, statErr
+	}
+	if err := writeCredentialAtomicMode(path, parsed.Raw, 0o600); err != nil {
+		return CredentialInfo{}, false, err
+	}
+	// Do not let a same-size, same-timestamp replacement reuse cached content.
+	p.mu.Lock()
+	delete(p.files, path)
+	p.mu.Unlock()
+	if err := p.scanUnlocked(); err != nil {
+		return CredentialInfo{}, false, err
+	}
+	info, ok := p.Credential(id)
+	if !ok {
+		return CredentialInfo{}, false, errors.New("credential was saved but not loaded")
+	}
+	return info, created, nil
+}
+
+// DeleteCredential removes every valid file for an account and immediately
+// evicts that account from scheduling. Existing leases retain their snapshots.
+func (p *Pool) DeleteCredential(ctx context.Context, id string) error {
+	p.mutationMu.Lock()
+	defer p.mutationMu.Unlock()
+	p.mu.RLock()
+	a := p.accounts[id]
+	p.mu.RUnlock()
+	if a == nil {
+		return ErrCredentialNotFound
+	}
+	if err := a.acquireRefresh(ctx); err != nil {
+		return err
+	}
+	defer a.releaseRefresh()
+
+	entries, err := os.ReadDir(p.cfg.Dir)
+	if err != nil {
+		return err
+	}
+	removed := false
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+			continue
+		}
+		path := filepath.Join(p.cfg.Dir, entry.Name())
+		cred, loadErr := loadCredential(path, p.cfg.Surface)
+		if loadErr != nil || accountID(cred.Subject) != id {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		removed = true
+	}
+	if !removed {
+		return ErrCredentialNotFound
+	}
+	p.mu.Lock()
+	delete(p.states, id)
+	p.mu.Unlock()
+	if err := p.scanUnlocked(); err != nil {
+		return err
+	}
+	return p.persistState()
 }
 
 func (p *Pool) Models() []string {
@@ -1037,6 +1227,12 @@ func (p *Pool) refreshAllDue() {
 }
 
 func (p *Pool) scan() error {
+	p.mutationMu.Lock()
+	defer p.mutationMu.Unlock()
+	return p.scanUnlocked()
+}
+
+func (p *Pool) scanUnlocked() error {
 	entries, err := os.ReadDir(p.cfg.Dir)
 	if err != nil {
 		return fmt.Errorf("read auths directory: %w", err)
@@ -1091,6 +1287,9 @@ func (p *Pool) scan() error {
 		p.rebuildActive()
 		if hadAccounts {
 			slog.Warn("credential pool is empty")
+			return nil
+		}
+		if p.cfg.AllowEmpty {
 			return nil
 		}
 		return ErrNoAuth

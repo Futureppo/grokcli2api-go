@@ -23,6 +23,11 @@ import (
 
 var ErrNoAuth = errors.New("no usable credentials in auths directory")
 
+var (
+	ErrInvalidCredentialJSON = errors.New("invalid credential JSON")
+	ErrInvalidCredential     = errors.New("invalid credential")
+)
+
 type Session struct {
 	Token      string   `json:"-"`
 	Surface    string   `json:"surface"`
@@ -68,15 +73,22 @@ func loadCredential(path, surface string) (*credential, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseCredential(b, path, surface)
+}
+
+func parseCredential(b []byte, path, surface string) (*credential, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(b, &raw); err != nil {
-		return nil, fmt.Errorf("invalid credential JSON: %w", err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidCredentialJSON, err)
+	}
+	if raw == nil {
+		return nil, fmt.Errorf("%w: credential must be a JSON object", ErrInvalidCredential)
 	}
 	node := credentialNode(raw)
 	access := firstString(node, "access_token", "AccessToken", "key", "session_token", "SessionToken")
 	refresh := firstString(node, "refresh_token", "RefreshToken")
 	if access == "" && refresh == "" {
-		return nil, errors.New("credential has neither access_token nor refresh_token")
+		return nil, fmt.Errorf("%w: credential has neither access_token nor refresh_token", ErrInvalidCredential)
 	}
 	accessClaims := jwtClaims(access)
 	idClaims := jwtClaims(firstString(node, "id_token", "IDToken"))
@@ -88,7 +100,7 @@ func loadCredential(path, surface string) (*credential, error) {
 		subject = claimString(idClaims, "sub")
 	}
 	if subject == "" {
-		return nil, errors.New("credential has no stable subject")
+		return nil, fmt.Errorf("%w: credential has no stable subject", ErrInvalidCredential)
 	}
 	clientID := firstString(node, "client_id", "clientId")
 	if clientID == "" {
@@ -236,6 +248,10 @@ func writeCredentialAtomic(path string, raw map[string]any) error {
 	if err != nil {
 		return err
 	}
+	return writeCredentialAtomicMode(path, raw, info.Mode().Perm())
+}
+
+func writeCredentialAtomicMode(path string, raw map[string]any, mode os.FileMode) error {
 	b, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
 		return err
@@ -247,7 +263,7 @@ func writeCredentialAtomic(path string, raw map[string]any) error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
 		return err
 	}
