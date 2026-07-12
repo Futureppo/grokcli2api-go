@@ -171,7 +171,7 @@ The service loads environment variables that are not already set from a `.env` f
 | `GROK_RETRY_MAX_ATTEMPTS` | `3` | Maximum distinct accounts tried per request |
 | `GROK_RETRY_BASE_DELAY` | `200ms` | Base delay for retryable network and 5xx failures |
 | `GROK_RATE_LIMIT_COOLDOWN` | `1m` | 429 cooldown when `Retry-After` is absent |
-| `GROK_QUOTA_COOLDOWN` | `24h` | Cooldown for quota-exhausted accounts |
+| `GROK_QUOTA_COOLDOWN` | `24h` | Quota cooldown; free-model limits are isolated per account and model, while spending limits cool the whole account |
 | `GROK_AFFINITY_TTL` | `1h` | In-memory session-affinity lifetime |
 | `GROK_AFFINITY_MAX_ENTRIES` | `100000` | Maximum affinity-cache entries |
 

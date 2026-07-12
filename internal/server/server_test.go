@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -221,6 +222,109 @@ func TestPermanentChatDenialStopsUsingOnlyAccount(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("disabled account called upstream %d times, want 1", got)
+	}
+}
+
+func TestFreeModelQuotaRetriesAndOnlyCoolsAffectedModel(t *testing.T) {
+	var mu sync.Mutex
+	deniedToken := ""
+	var grok4Tokens, buildTokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		model, _ := body["model"].(string)
+		mu.Lock()
+		if model == "grok-4" {
+			grok4Tokens = append(grok4Tokens, token)
+			if deniedToken == "" {
+				deniedToken = token
+			}
+		} else if model == "grok-build" {
+			buildTokens = append(buildTokens, token)
+		}
+		denied := token == deniedToken
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if model == "grok-4" && denied {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"status_code":429,"error":"You've used all the included free usage for model grok-4 for now. Usage resets over a rolling 24-hour window."}`)
+			return
+		}
+		if model == "grok-build" && !denied {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":"try another account"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-ok","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a", "token-b"})
+
+	request := func(model string) {
+		rec := httptest.NewRecorder()
+		body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, model)
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("model=%s status=%d body=%s", model, rec.Code, rec.Body.String())
+		}
+	}
+	request("grok-4")
+	request("grok-4")
+	request("grok-build")
+
+	mu.Lock()
+	defer mu.Unlock()
+	deniedGrok4Calls := 0
+	for _, token := range grok4Tokens {
+		if token == deniedToken {
+			deniedGrok4Calls++
+		}
+	}
+	if deniedGrok4Calls != 1 {
+		t.Fatalf("quota-exhausted account received %d grok-4 calls, tokens=%v", deniedGrok4Calls, grok4Tokens)
+	}
+	if !slices.Contains(buildTokens, deniedToken) {
+		t.Fatalf("quota-exhausted account was not available for another model: %v", buildTokens)
+	}
+}
+
+func TestFreeModelQuotaRetriesStream(t *testing.T) {
+	var mu sync.Mutex
+	var tokens []string
+	deniedToken := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		tokens = append(tokens, token)
+		if deniedToken == "" {
+			deniedToken = token
+		}
+		denied := token == deniedToken
+		mu.Unlock()
+		if denied {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":"You've used all the included free usage for model grok-4 for now."}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a", "token-b"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"content":"ok"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tokens) != 2 || tokens[0] == tokens[1] {
+		t.Fatalf("expected stream retry on a different account, got %v", tokens)
 	}
 }
 

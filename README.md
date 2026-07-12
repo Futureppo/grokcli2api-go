@@ -171,7 +171,7 @@ curl http://localhost:8088/v1/messages \
 | `GROK_RETRY_MAX_ATTEMPTS` | `3` | 单个请求最多尝试的不同账号数 |
 | `GROK_RETRY_BASE_DELAY` | `200ms` | 可重试网络与 5xx 错误的基础退避 |
 | `GROK_RATE_LIMIT_COOLDOWN` | `1m` | 无 `Retry-After` 时的 429 冷却时间 |
-| `GROK_QUOTA_COOLDOWN` | `24h` | 额度耗尽账号的冷却时间 |
+| `GROK_QUOTA_COOLDOWN` | `24h` | 额度耗尽冷却时间；免费模型额度按账号与模型隔离，账号支出额度按整个账号隔离 |
 | `GROK_AFFINITY_TTL` | `1h` | 内存会话亲和有效期 |
 | `GROK_AFFINITY_MAX_ENTRIES` | `100000` | 会话亲和缓存容量上限 |
 

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -181,6 +182,32 @@ func TestRefreshPreservesQuotaCooldown(t *testing.T) {
 		lease.Release()
 		t.Fatal("OAuth refresh cleared the quota cooldown")
 	}
+}
+
+func TestRefreshPreservesModelCooldown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"token-new","refresh_token":"refresh-new","expires_in":3600}`))
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	writeTestCredentialModels(t, dir, "a.json", "subject-a", "token-old", time.Now().Add(time.Hour), server.URL, []string{"grok-alpha", "grok-beta"})
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	id := accountID("subject-a")
+	pool.MarkModelCooldown(id, "grok-alpha", "model_free_quota_exhausted", time.Hour)
+	if err := pool.Refresh(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	var unavailable *UnavailableError
+	if _, err := pool.Acquire(context.Background(), Affinity{}, "grok-alpha", nil); !errors.As(err, &unavailable) || !unavailable.Cooling {
+		t.Fatalf("model cooldown was cleared by OAuth refresh: %v", err)
+	}
+	lease, err := pool.Acquire(context.Background(), Affinity{}, "grok-beta", nil)
+	if err != nil {
+		t.Fatalf("unrelated model was unavailable after refresh: %v", err)
+	}
+	lease.Release()
 }
 
 func TestPoolRoundRobinAffinityAndConcurrentLease(t *testing.T) {
@@ -398,6 +425,80 @@ func TestCooldownUpdatesAreCoalescedAndExpireWithoutDirectoryScan(t *testing.T) 
 	}
 	if got := len(pool.schedulingSnapshot("grok-4")); got != 2 {
 		t.Fatalf("active model snapshot contains %d accounts after cooldown expiry, want 2", got)
+	}
+}
+
+func TestModelCooldownIsScopedAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredentialModels(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "", []string{"grok-alpha", "grok-beta"})
+	pool := newTestPool(t, dir)
+	id := accountID("subject-a")
+	pool.MarkModelCooldown(id, "grok-alpha", "model_free_quota_exhausted", time.Hour)
+
+	var unavailable *UnavailableError
+	if _, err := pool.Acquire(context.Background(), Affinity{}, "grok-alpha", nil); !errors.As(err, &unavailable) || !unavailable.Cooling {
+		t.Fatalf("cooled model error=%v, want cooling unavailable error", err)
+	}
+	if unavailable.RetryAfter < 59*time.Minute {
+		t.Fatalf("model retry-after=%s, want approximately one hour", unavailable.RetryAfter)
+	}
+	lease, err := pool.Acquire(context.Background(), Affinity{}, "grok-beta", nil)
+	if err != nil {
+		t.Fatalf("unrelated model was cooled: %v", err)
+	}
+	lease.Release()
+	if !pool.HasModel("grok-alpha") || !slices.Contains(pool.Models(), "grok-alpha") {
+		t.Fatal("cooled model disappeared from the model catalog")
+	}
+	pool.Close()
+
+	stateBytes, err := os.ReadFile(filepath.Join(dir, stateFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateText := string(stateBytes)
+	if !strings.Contains(stateText, `"model_cooldowns"`) || !strings.Contains(stateText, `"grok-alpha"`) {
+		t.Fatalf("model cooldown was not persisted: %s", stateText)
+	}
+	if strings.Contains(stateText, "token-a") || strings.Contains(stateText, "subject-a") {
+		t.Fatal("persisted model cooldown contains credential data")
+	}
+
+	reloaded := newTestPool(t, dir)
+	defer reloaded.Close()
+	unavailable = nil
+	if _, err := reloaded.Acquire(context.Background(), Affinity{}, "grok-alpha", nil); !errors.As(err, &unavailable) || !unavailable.Cooling {
+		t.Fatalf("persisted model cooldown was not restored: %v", err)
+	}
+	lease, err = reloaded.Acquire(context.Background(), Affinity{}, "grok-beta", nil)
+	if err != nil {
+		t.Fatalf("persisted cooldown affected unrelated model: %v", err)
+	}
+	lease.Release()
+}
+
+func TestModelCooldownExpiresWithoutDirectoryScan(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	id := accountID("subject-a")
+	pool.MarkModelCooldown(id, "grok-4", "model_free_quota_exhausted", 30*time.Millisecond)
+	var unavailable *UnavailableError
+	if _, err := pool.Acquire(context.Background(), Affinity{}, "grok-4", nil); !errors.As(err, &unavailable) {
+		t.Fatalf("model was not cooled: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		lease, err := pool.Acquire(context.Background(), Affinity{}, "grok-4", nil)
+		if err == nil {
+			lease.Release()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("model cooldown did not expire: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

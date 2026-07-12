@@ -68,16 +68,17 @@ type account struct {
 	agentID   string
 	sessionID string
 
-	mu            sync.RWMutex
-	credential    *credential
-	cooldownUntil time.Time
-	cooldownCause string
-	disabled      bool
-	disableReason string
-	refreshOnce   sync.Once
-	refreshLock   chan struct{}
-	generation    atomic.Uint64
-	inflight      atomic.Int64
+	mu             sync.RWMutex
+	credential     *credential
+	cooldownUntil  time.Time
+	cooldownCause  string
+	modelCooldowns map[string]cooldownState
+	disabled       bool
+	disableReason  string
+	refreshOnce    sync.Once
+	refreshLock    chan struct{}
+	generation     atomic.Uint64
+	inflight       atomic.Int64
 }
 
 func (a *account) currentGeneration() uint64 {
@@ -125,7 +126,11 @@ func (a *account) supportsModel(model string) bool {
 		return false
 	}
 	index := sort.SearchStrings(a.credential.Models, model)
-	return index < len(a.credential.Models) && a.credential.Models[index] == model
+	if index >= len(a.credential.Models) || a.credential.Models[index] != model {
+		return false
+	}
+	cooldown, cooling := a.modelCooldowns[model]
+	return !cooling || !time.Now().Before(cooldown.Until)
 }
 
 func (a *account) snapshot() (*credential, time.Time, bool) {
@@ -146,10 +151,16 @@ type persistedState struct {
 }
 
 type accountState struct {
-	CooldownUntil         time.Time `json:"cooldown_until,omitempty"`
-	Reason                string    `json:"reason,omitempty"`
-	Disabled              bool      `json:"disabled,omitempty"`
-	CredentialFingerprint string    `json:"credential_fingerprint,omitempty"`
+	CooldownUntil         time.Time                `json:"cooldown_until,omitempty"`
+	Reason                string                   `json:"reason,omitempty"`
+	Disabled              bool                     `json:"disabled,omitempty"`
+	CredentialFingerprint string                   `json:"credential_fingerprint,omitempty"`
+	ModelCooldowns        map[string]cooldownState `json:"model_cooldowns,omitempty"`
+}
+
+type cooldownState struct {
+	Until  time.Time `json:"until"`
+	Reason string    `json:"reason,omitempty"`
 }
 
 type Pool struct {
@@ -304,7 +315,7 @@ func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exc
 				if model != "" && !p.hasKnownModel(model) {
 					return nil, &ModelUnavailableError{Model: model}
 				}
-				return nil, p.unavailable()
+				return nil, p.unavailable(model)
 			}
 		}
 		start := int(p.cursor.Add(1)-1) % len(active)
@@ -360,7 +371,7 @@ func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exc
 		if model != "" && !p.hasKnownModel(model) {
 			return nil, &ModelUnavailableError{Model: model}
 		}
-		return nil, p.unavailable()
+		return nil, p.unavailable(model)
 	}
 }
 
@@ -531,7 +542,14 @@ func (p *Pool) HasModel(model string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, a := range p.accounts {
-		if a.supportsModel(model) {
+		a.mu.RLock()
+		index := 0
+		if a.credential != nil {
+			index = sort.SearchStrings(a.credential.Models, model)
+		}
+		available := !a.disabled && a.credential != nil && index < len(a.credential.Models) && a.credential.Models[index] == model
+		a.mu.RUnlock()
+		if available {
 			return true
 		}
 	}
@@ -673,12 +691,75 @@ func (p *Pool) MarkCooldown(accountID, reason string, duration time.Duration) {
 		return
 	}
 	p.mu.Lock()
-	p.states[accountID] = accountState{CooldownUntil: until, Reason: reason}
+	state := p.states[accountID]
+	state.CooldownUntil, state.Reason = until, reason
+	p.states[accountID] = state
 	p.mu.Unlock()
 	p.requestRebuild()
 	p.rebuildWhenCooldownExpires(until)
 	_ = p.persistState()
 	slog.Warn("credential account cooling", "account", accountID, "reason", reason, "until", until.UTC().Format(time.RFC3339))
+}
+
+func (p *Pool) MarkModelCooldown(accountID, model, reason string, duration time.Duration) {
+	if model == "" {
+		p.MarkCooldown(accountID, reason, duration)
+		return
+	}
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return
+	}
+	now := time.Now()
+	until := now.Add(duration)
+	a.mu.Lock()
+	if a.modelCooldowns == nil {
+		a.modelCooldowns = make(map[string]cooldownState)
+	}
+	existing := a.modelCooldowns[model]
+	remaining := time.Until(existing.Until)
+	extensionThreshold := remaining / 10
+	if extensionThreshold < 5*time.Second {
+		extensionThreshold = 5 * time.Second
+	}
+	changed := !now.Before(existing.Until) || until.After(existing.Until.Add(extensionThreshold))
+	if changed {
+		a.modelCooldowns[model] = cooldownState{Until: until, Reason: reason}
+	} else {
+		until, reason = existing.Until, existing.Reason
+	}
+	a.mu.Unlock()
+	if !changed {
+		return
+	}
+	p.mu.Lock()
+	state := p.states[accountID]
+	state.ModelCooldowns = cloneModelCooldowns(state.ModelCooldowns)
+	if state.ModelCooldowns == nil {
+		state.ModelCooldowns = make(map[string]cooldownState)
+	}
+	state.ModelCooldowns[model] = cooldownState{Until: until, Reason: reason}
+	p.states[accountID] = state
+	p.mu.Unlock()
+	p.requestRebuild()
+	p.rebuildWhenCooldownExpires(until)
+	if err := p.persistState(); err != nil {
+		slog.Error("credential scheduler state persistence failed", "error", err)
+	}
+	slog.Warn("credential model cooling", "account", accountID, "model", model, "reason", reason, "until", until.UTC().Format(time.RFC3339))
+}
+
+func cloneModelCooldowns(source map[string]cooldownState) map[string]cooldownState {
+	if len(source) == 0 {
+		return nil
+	}
+	cloned := make(map[string]cooldownState, len(source))
+	for model, cooldown := range source {
+		cloned[model] = cooldown
+	}
+	return cloned
 }
 
 func (p *Pool) rebuildWhenCooldownExpires(until time.Time) {
@@ -710,7 +791,9 @@ func (p *Pool) Disable(accountID, reason string) {
 		return
 	}
 	p.mu.Lock()
-	p.states[accountID] = accountState{Disabled: true, Reason: reason, CredentialFingerprint: fingerprint}
+	state := p.states[accountID]
+	state.Disabled, state.Reason, state.CredentialFingerprint = true, reason, fingerprint
+	p.states[accountID] = state
 	p.mu.Unlock()
 	p.requestRebuild()
 	if err := p.persistState(); err != nil {
@@ -853,15 +936,28 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 	a.generation.Add(1)
 	a.disabled = false
 	a.disableReason = ""
-	keepCooldown := time.Now().Before(a.cooldownUntil) && a.cooldownCause != "" && a.cooldownCause != "refresh_backoff"
+	now := time.Now()
+	keepCooldown := now.Before(a.cooldownUntil) && a.cooldownCause != "" && a.cooldownCause != "refresh_backoff"
+	hasModelCooldown := false
+	for _, cooldown := range a.modelCooldowns {
+		if now.Before(cooldown.Until) {
+			hasModelCooldown = true
+			break
+		}
+	}
 	if !keepCooldown {
 		a.cooldownUntil = time.Time{}
 		a.cooldownCause = ""
 	}
 	a.mu.Unlock()
 	p.mu.Lock()
-	if !keepCooldown {
+	if !keepCooldown && !hasModelCooldown {
 		delete(p.states, a.id)
+	} else if !keepCooldown {
+		state := p.states[a.id]
+		state.CooldownUntil = time.Time{}
+		state.Reason = ""
+		p.states[a.id] = state
 	}
 	if cached, ok := p.files[next.Path]; ok {
 		if info, statErr := os.Stat(next.Path); statErr == nil {
@@ -1023,7 +1119,16 @@ func (p *Pool) scan() error {
 				existing.disableReason = ""
 				existing.cooldownUntil = time.Time{}
 				existing.cooldownCause = ""
-				delete(p.states, id)
+				state := p.states[id]
+				state.Disabled = false
+				state.CredentialFingerprint = ""
+				state.CooldownUntil = time.Time{}
+				state.Reason = ""
+				if len(state.ModelCooldowns) == 0 {
+					delete(p.states, id)
+				} else {
+					p.states[id] = state
+				}
 			}
 			existing.mu.Unlock()
 			continue
@@ -1034,13 +1139,30 @@ func (p *Pool) scan() error {
 			if state.Disabled {
 				fingerprintChanged := state.CredentialFingerprint != "" && state.CredentialFingerprint != credentialFingerprint(cred)
 				if fingerprintChanged {
-					delete(p.states, id)
+					state.Disabled = false
+					state.CredentialFingerprint = ""
+					state.CooldownUntil = time.Time{}
+					state.Reason = ""
+					if len(state.ModelCooldowns) == 0 {
+						delete(p.states, id)
+					} else {
+						p.states[id] = state
+					}
 				} else {
 					a.disabled, a.disableReason = true, state.Reason
 				}
 			} else if time.Now().Before(state.CooldownUntil) {
 				a.cooldownUntil, a.cooldownCause = state.CooldownUntil, state.Reason
 				cooldowns = append(cooldowns, state.CooldownUntil)
+			}
+			for model, cooldown := range state.ModelCooldowns {
+				if time.Now().Before(cooldown.Until) {
+					if a.modelCooldowns == nil {
+						a.modelCooldowns = make(map[string]cooldownState)
+					}
+					a.modelCooldowns[model] = cooldown
+					cooldowns = append(cooldowns, cooldown.Until)
+				}
 			}
 		}
 		p.accounts[id] = a
@@ -1079,7 +1201,12 @@ func (p *Pool) rebuildActive() {
 		available := !a.disabled && !now.Before(a.cooldownUntil) && a.credential != nil
 		var models []string
 		if available {
-			models = append(models, a.credential.Models...)
+			for _, model := range a.credential.Models {
+				cooldown, cooling := a.modelCooldowns[model]
+				if !cooling || !now.Before(cooldown.Until) {
+					models = append(models, model)
+				}
+			}
 		}
 		a.mu.RUnlock()
 		if !available {
@@ -1131,14 +1258,27 @@ func (p *Pool) rebuildLoop() {
 	}
 }
 
-func (p *Pool) unavailable() error {
+func (p *Pool) unavailable(model string) error {
 	now := time.Now()
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	var earliest time.Time
 	hasCooling := false
 	for _, a := range p.accounts {
-		_, until, disabled := a.snapshot()
+		a.mu.RLock()
+		until, disabled := a.cooldownUntil, a.disabled
+		if !now.Before(until) {
+			until = time.Time{}
+		}
+		if model != "" && !disabled && a.credential != nil {
+			index := sort.SearchStrings(a.credential.Models, model)
+			if index < len(a.credential.Models) && a.credential.Models[index] == model {
+				if cooldown, ok := a.modelCooldowns[model]; ok && now.Before(cooldown.Until) && cooldown.Until.After(until) {
+					until = cooldown.Until
+				}
+			}
+		}
+		a.mu.RUnlock()
 		if !disabled && now.Before(until) {
 			hasCooling = true
 			if earliest.IsZero() || until.Before(earliest) {
@@ -1166,7 +1306,14 @@ func (p *Pool) loadState() error {
 	}
 	now := time.Now()
 	for id, item := range state.Accounts {
-		if item.Disabled || now.Before(item.CooldownUntil) {
+		activeModels := make(map[string]cooldownState)
+		for model, cooldown := range item.ModelCooldowns {
+			if now.Before(cooldown.Until) {
+				activeModels[model] = cooldown
+			}
+		}
+		item.ModelCooldowns = activeModels
+		if item.Disabled || now.Before(item.CooldownUntil) || len(item.ModelCooldowns) > 0 {
 			p.states[id] = item
 		}
 	}
@@ -1178,8 +1325,22 @@ func (p *Pool) persistState() error {
 	defer p.stateMu.Unlock()
 	p.mu.RLock()
 	state := persistedState{Version: 1, Accounts: map[string]accountState{}}
+	now := time.Now()
 	for id, item := range p.states {
-		if item.Disabled || time.Now().Before(item.CooldownUntil) {
+		if !now.Before(item.CooldownUntil) {
+			item.CooldownUntil = time.Time{}
+			if !item.Disabled {
+				item.Reason = ""
+			}
+		}
+		activeModels := make(map[string]cooldownState)
+		for model, cooldown := range item.ModelCooldowns {
+			if now.Before(cooldown.Until) {
+				activeModels[model] = cooldown
+			}
+		}
+		item.ModelCooldowns = activeModels
+		if item.Disabled || now.Before(item.CooldownUntil) || len(item.ModelCooldowns) > 0 {
 			state.Accounts[id] = item
 		}
 	}

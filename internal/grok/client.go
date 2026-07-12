@@ -34,6 +34,10 @@ const permanentChatDenialMessage = "access to the chat endpoint is denied"
 
 const permanentChatDenialReason = "chat_endpoint_denied"
 
+const freeModelQuotaMessage = "used all the included free usage for model"
+
+const freeModelQuotaReason = "model_free_quota_exhausted"
+
 type APIError struct {
 	Status          int
 	Body            string
@@ -466,7 +470,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 					continue
 				}
 			}
-			if !c.handleRetryable(accountID, apiErr) || len(used) >= c.cfg.RetryMaxAttempts {
+			if !c.handleRetryable(accountID, model, apiErr) || len(used) >= c.cfg.RetryMaxAttempts {
 				if strings.EqualFold(apiErr.UpstreamCode, quotaErrorCode) {
 					apiErr.Status = http.StatusTooManyRequests
 					apiErr.UpstreamCode = "account_pool_retry_exhausted"
@@ -592,7 +596,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 					continue
 				}
 			}
-			if !c.handleRetryable(accountID, apiErr) || len(used) >= c.cfg.RetryMaxAttempts {
+			if !c.handleRetryable(accountID, model, apiErr) || len(used) >= c.cfg.RetryMaxAttempts {
 				if strings.EqualFold(apiErr.UpstreamCode, quotaErrorCode) {
 					apiErr.Status = http.StatusTooManyRequests
 					apiErr.UpstreamCode = "account_pool_retry_exhausted"
@@ -652,7 +656,11 @@ func (c *Client) do(ctx context.Context, lease *auth.Lease, method, path string,
 	return resp, wrote.Load(), nil
 }
 
-func (c *Client) handleRetryable(accountID string, err *APIError) bool {
+func (c *Client) handleRetryable(accountID, model string, err *APIError) bool {
+	if isFreeModelQuotaExhausted(err) {
+		c.pool.MarkModelCooldown(accountID, model, freeModelQuotaReason, c.cfg.QuotaCooldown)
+		return true
+	}
 	if strings.EqualFold(err.UpstreamCode, quotaErrorCode) {
 		c.pool.MarkCooldown(accountID, "quota_exhausted", c.cfg.QuotaCooldown)
 		return true
@@ -688,6 +696,14 @@ func isPermanentAccountDenial(err *APIError) bool {
 	}
 	text := strings.ToLower(strings.Join([]string{err.UpstreamCode, err.UpstreamMessage, err.Body}, " "))
 	return strings.Contains(text, permanentChatDenialMessage)
+}
+
+func isFreeModelQuotaExhausted(err *APIError) bool {
+	if err == nil || err.Status != http.StatusTooManyRequests {
+		return false
+	}
+	text := strings.ToLower(strings.Join([]string{err.UpstreamCode, err.UpstreamMessage, err.Body}, " "))
+	return strings.Contains(text, freeModelQuotaMessage)
 }
 
 func (c *Client) backoff(ctx context.Context, attempt int) error {
@@ -802,6 +818,10 @@ func (s *EventStream) observe(data []byte) {
 	}
 	if strings.EqualFold(code, quotaErrorCode) {
 		s.pool.MarkCooldown(s.accountID, "quota_exhausted", s.quotaCooldown)
+		return
+	}
+	if isFreeModelQuotaExhausted(&APIError{Status: http.StatusTooManyRequests, Body: string(data)}) {
+		s.pool.MarkModelCooldown(s.accountID, s.model, freeModelQuotaReason, s.quotaCooldown)
 	}
 }
 

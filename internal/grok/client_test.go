@@ -77,6 +77,30 @@ func TestPermanentAccountDenialDetection(t *testing.T) {
 	}
 }
 
+func TestFreeModelQuotaDetection(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "top-level error", status: http.StatusTooManyRequests, body: `{"status_code":429,"error":"You've used all the included free usage for model grok-4.5-build-free for now."}`, want: true},
+		{name: "nested error", status: http.StatusTooManyRequests, body: `{"error":{"message":"YOU'VE USED ALL THE INCLUDED FREE USAGE FOR MODEL grok-build"}}`, want: true},
+		{name: "ordinary rate limit", status: http.StatusTooManyRequests, body: `{"error":"too many requests"}`},
+		{name: "different quota", status: http.StatusTooManyRequests, body: `{"error":"monthly credits exhausted"}`},
+		{name: "matching text without 429", status: http.StatusForbidden, body: `{"error":"You've used all the included free usage for model grok-build"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: test.status, Header: http.Header{}}
+			apiErr := parseAPIError(response, []byte(test.body))
+			if got := isFreeModelQuotaExhausted(apiErr); got != test.want {
+				t.Fatalf("isFreeModelQuotaExhausted() = %v, want %v; error=%#v", got, test.want, apiErr)
+			}
+		})
+	}
+}
+
 func TestRefreshModelsDiscoversEveryAccountAndPersistsCatalogs(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
