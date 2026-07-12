@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Futureppo/grokcli2api-go/actions/workflows/ci.yml/badge.svg)](https://github.com/Futureppo/grokcli2api-go/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.23%2B-00ADD8?logo=go)](https://go.dev/)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
 中文 | [English](README_EN.md)
 
@@ -35,6 +36,8 @@
 | OpenAI | `GET /v1/models` | — |
 
 兼容层会尽量保留常用请求和响应格式，但不能保证覆盖官方 API 的全部参数和行为。
+
+> 使用 New API 等 API 聚合项目接入时，请开启所有请求参数的透传。
 
 ## 快速开始
 
@@ -250,3 +253,7 @@ go build ./cmd/grok2api
 ```
 
 提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。Bug 和功能建议可通过 [GitHub Issues](https://github.com/Futureppo/grokcli2api-go/issues) 提交。
+
+## 许可证
+
+本项目基于 [GNU Affero General Public License v3.0](LICENSE) 发布。
