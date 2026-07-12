@@ -513,6 +513,77 @@ func TestCooldownPersistsAndAffinityMigrates(t *testing.T) {
 	}
 }
 
+func TestDisabledCredentialPersistsUntilTokensChange(t *testing.T) {
+	t.Run("unchanged credential stays disabled across restart", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+		writeTestCredential(t, dir, "b.json", "subject-b", "token-b", time.Now().Add(time.Hour), "")
+
+		pool := newTestPool(t, dir)
+		id := accountID("subject-a")
+		pool.Disable(id, "chat_endpoint_denied")
+		pool.Close()
+
+		stateBytes, err := os.ReadFile(filepath.Join(dir, stateFileName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stateText := string(stateBytes)
+		if !strings.Contains(stateText, `"credential_fingerprint"`) {
+			t.Fatalf("persisted state has no credential fingerprint: %s", stateText)
+		}
+		if strings.Contains(stateText, "token-a") || strings.Contains(stateText, "refresh-a") || strings.Contains(stateText, "subject-a") {
+			t.Fatal("persisted state contains credential data")
+		}
+
+		reloaded := newTestPool(t, dir)
+		defer reloaded.Close()
+		if lease, err := reloaded.AcquireAccount(context.Background(), id); err == nil {
+			lease.Release()
+			t.Fatal("unchanged disabled credential became available after restart")
+		}
+	})
+
+	t.Run("token replacement restores during hot reload", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+		pool := newTestPool(t, dir)
+		defer pool.Close()
+		id := accountID("subject-a")
+		pool.Disable(id, "chat_endpoint_denied")
+
+		writeTestCredential(t, dir, "a.json", "subject-a", "replacement-token", time.Now().Add(time.Hour), "")
+		if err := pool.scan(); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := pool.AcquireAccount(context.Background(), id)
+		if err != nil {
+			t.Fatalf("replacement credential was not restored: %v", err)
+		}
+		lease.Release()
+	})
+
+	t.Run("token replacement restores after restart", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+		writeTestCredential(t, dir, "b.json", "subject-b", "token-b", time.Now().Add(time.Hour), "")
+		id := accountID("subject-a")
+
+		pool := newTestPool(t, dir)
+		pool.Disable(id, "chat_endpoint_denied")
+		pool.Close()
+		writeTestCredential(t, dir, "a.json", "subject-a", "replacement-token", time.Now().Add(time.Hour), "")
+
+		reloaded := newTestPool(t, dir)
+		defer reloaded.Close()
+		lease, err := reloaded.AcquireAccount(context.Background(), id)
+		if err != nil {
+			t.Fatalf("replacement credential was not restored after restart: %v", err)
+		}
+		lease.Release()
+	})
+}
+
 func TestHotReloadAddsAndRemovesCredentials(t *testing.T) {
 	dir := t.TempDir()
 	pathA := writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")

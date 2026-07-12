@@ -30,6 +30,10 @@ import (
 
 const quotaErrorCode = "personal-team-blocked:spending-limit"
 
+const permanentChatDenialMessage = "access to the chat endpoint is denied"
+
+const permanentChatDenialReason = "chat_endpoint_denied"
+
 type APIError struct {
 	Status          int
 	Body            string
@@ -300,6 +304,10 @@ func (c *Client) fetchAccountModels(ctx context.Context, accountID string, refre
 	}
 	if resp.StatusCode >= 400 {
 		apiErr := parseAPIError(resp, payload)
+		if isPermanentAccountDenial(apiErr) {
+			c.pool.Disable(accountID, permanentChatDenialReason)
+			return nil, apiErr
+		}
 		if isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
 			return c.fetchAccountModels(ctx, accountID, true)
 		}
@@ -394,6 +402,10 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 		}
 		timing.MarkAcquire(time.Since(acquireStarted))
 		if err != nil {
+			var permanentDenial *APIError
+			if errors.As(lastErr, &permanentDenial) && isPermanentAccountDenial(permanentDenial) {
+				return nil, lastErr
+			}
 			var unavailable *auth.UnavailableError
 			if errors.As(err, &unavailable) {
 				return nil, err
@@ -428,6 +440,13 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			apiErr := parseAPIError(resp, data)
 			lease.Release()
 			lastErr = apiErr
+			if isPermanentAccountDenial(apiErr) {
+				c.pool.Disable(accountID, permanentChatDenialReason)
+				if len(used) < c.cfg.RetryMaxAttempts {
+					continue
+				}
+				return nil, apiErr
+			}
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
 				refreshStarted := time.Now()
@@ -509,6 +528,10 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 		}
 		timing.MarkAcquire(time.Since(acquireStarted))
 		if err != nil {
+			var permanentDenial *APIError
+			if errors.As(lastErr, &permanentDenial) && isPermanentAccountDenial(permanentDenial) {
+				return nil, lastErr
+			}
 			var unavailable *auth.UnavailableError
 			if errors.As(err, &unavailable) {
 				return nil, err
@@ -542,6 +565,13 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			}
 			apiErr := parseAPIError(resp, data)
 			lastErr = apiErr
+			if isPermanentAccountDenial(apiErr) {
+				c.pool.Disable(accountID, permanentChatDenialReason)
+				if len(used) < c.cfg.RetryMaxAttempts {
+					continue
+				}
+				return nil, apiErr
+			}
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
 				refreshStarted := time.Now()
@@ -650,6 +680,14 @@ func isAuthError(err *APIError) bool {
 	}
 	text := strings.ToLower(err.UpstreamCode + " " + err.UpstreamMessage)
 	return strings.Contains(text, "auth") || strings.Contains(text, "token")
+}
+
+func isPermanentAccountDenial(err *APIError) bool {
+	if err == nil || err.Status != http.StatusForbidden {
+		return false
+	}
+	text := strings.ToLower(strings.Join([]string{err.UpstreamCode, err.UpstreamMessage, err.Body}, " "))
+	return strings.Contains(text, permanentChatDenialMessage)
 }
 
 func (c *Client) backoff(ctx context.Context, attempt int) error {

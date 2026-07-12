@@ -120,6 +120,110 @@ func TestQuotaErrorSwitchesAccount(t *testing.T) {
 	}
 }
 
+func TestPermanentChatDenialDisablesAccountAndRetries(t *testing.T) {
+	var mu sync.Mutex
+	var tokens []string
+	deniedToken := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		tokens = append(tokens, token)
+		if deniedToken == "" {
+			deniedToken = token
+		}
+		denied := token == deniedToken
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if denied {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"status_code":403,"error":"Access to the chat endpoint is denied. Please update the permissions."}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-ok","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a", "token-b"})
+
+	request := func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}]}`))
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	request()
+	request()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tokens) != 3 || tokens[0] == tokens[1] || tokens[2] != tokens[1] {
+		t.Fatalf("disabled account was scheduled again: %v", tokens)
+	}
+}
+
+func TestPermanentChatDenialDisablesAccountAndRetriesStream(t *testing.T) {
+	var mu sync.Mutex
+	var tokens []string
+	deniedToken := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		tokens = append(tokens, token)
+		if deniedToken == "" {
+			deniedToken = token
+		}
+		denied := token == deniedToken
+		mu.Unlock()
+		if denied {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":{"message":"Access to the chat endpoint is denied"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a", "token-b"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"content":"ok"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tokens) != 2 || tokens[0] == tokens[1] {
+		t.Fatalf("expected stream retry on a different account, got %v", tokens)
+	}
+}
+
+func TestPermanentChatDenialStopsUsingOnlyAccount(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":"Access to the chat endpoint is denied"}`)
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a"})
+	request := func() int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}]}`))
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if status := request(); status != http.StatusForbidden {
+		t.Fatalf("first status=%d, want 403", status)
+	}
+	if status := request(); status != http.StatusServiceUnavailable {
+		t.Fatalf("second status=%d, want 503", status)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("disabled account called upstream %d times, want 1", got)
+	}
+}
+
 func TestConcurrent401RefreshesCredentialOnce(t *testing.T) {
 	var refreshCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

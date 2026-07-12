@@ -146,9 +146,10 @@ type persistedState struct {
 }
 
 type accountState struct {
-	CooldownUntil time.Time `json:"cooldown_until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	Disabled      bool      `json:"disabled,omitempty"`
+	CooldownUntil         time.Time `json:"cooldown_until,omitempty"`
+	Reason                string    `json:"reason,omitempty"`
+	Disabled              bool      `json:"disabled,omitempty"`
+	CredentialFingerprint string    `json:"credential_fingerprint,omitempty"`
 }
 
 type Pool struct {
@@ -300,7 +301,7 @@ func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exc
 			p.rebuildActive()
 			active = p.schedulingSnapshot(model)
 			if len(active) == 0 {
-				if model != "" && !p.HasModel(model) {
+				if model != "" && !p.hasKnownModel(model) {
 					return nil, &ModelUnavailableError{Model: model}
 				}
 				return nil, p.unavailable()
@@ -356,7 +357,7 @@ func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exc
 			}
 			continue
 		}
-		if model != "" && !p.HasModel(model) {
+		if model != "" && !p.hasKnownModel(model) {
 			return nil, &ModelUnavailableError{Model: model}
 		}
 		return nil, p.unavailable()
@@ -537,6 +538,27 @@ func (p *Pool) HasModel(model string) bool {
 	return false
 }
 
+func (p *Pool) hasKnownModel(model string) bool {
+	if model == "" {
+		return true
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, a := range p.accounts {
+		a.mu.RLock()
+		known := false
+		if cred := a.credential; cred != nil {
+			index := sort.SearchStrings(cred.Models, model)
+			known = index < len(cred.Models) && cred.Models[index] == model
+		}
+		a.mu.RUnlock()
+		if known {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Pool) AccountsNeedingModelRefresh(interval time.Duration) []string {
 	now := time.Now()
 	p.mu.RLock()
@@ -682,16 +704,27 @@ func (p *Pool) Disable(accountID, reason string) {
 	a.mu.Lock()
 	changed := !a.disabled || a.disableReason != reason
 	a.disabled, a.disableReason = true, reason
+	fingerprint := credentialFingerprint(a.credential)
 	a.mu.Unlock()
 	if !changed {
 		return
 	}
 	p.mu.Lock()
-	p.states[accountID] = accountState{Disabled: true, Reason: reason}
+	p.states[accountID] = accountState{Disabled: true, Reason: reason, CredentialFingerprint: fingerprint}
 	p.mu.Unlock()
 	p.requestRebuild()
-	_ = p.persistState()
+	if err := p.persistState(); err != nil {
+		slog.Error("credential scheduler state persistence failed", "error", err)
+	}
 	slog.Warn("credential account disabled", "account", accountID, "reason", reason)
+}
+
+func credentialFingerprint(cred *credential) string {
+	if cred == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(cred.AccessToken + "\x00" + cred.RefreshToken))
+	return hex.EncodeToString(sum[:])
 }
 
 func (p *Pool) hasReadyAccount() bool {
@@ -999,7 +1032,12 @@ func (p *Pool) scan() error {
 		a.generation.Store(1)
 		if state, ok := p.states[id]; ok {
 			if state.Disabled {
-				a.disabled, a.disableReason = true, state.Reason
+				fingerprintChanged := state.CredentialFingerprint != "" && state.CredentialFingerprint != credentialFingerprint(cred)
+				if fingerprintChanged {
+					delete(p.states, id)
+				} else {
+					a.disabled, a.disableReason = true, state.Reason
+				}
 			} else if time.Now().Before(state.CooldownUntil) {
 				a.cooldownUntil, a.cooldownCause = state.CooldownUntil, state.Reason
 				cooldowns = append(cooldowns, state.CooldownUntil)

@@ -51,6 +51,32 @@ func TestHTTPClientKeepsWarmConnections(t *testing.T) {
 	}
 }
 
+func TestPermanentAccountDenialDetection(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "top-level error", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied. Please update permissions."}`, want: true},
+		{name: "nested error", status: http.StatusForbidden, body: `{"error":{"code":"permission_denied","message":"ACCESS TO THE CHAT ENDPOINT IS DENIED"}}`, want: true},
+		{name: "raw text", status: http.StatusForbidden, body: `Access to the chat endpoint is denied.`, want: true},
+		{name: "other forbidden", status: http.StatusForbidden, body: `{"error":"model access denied"}`},
+		{name: "quota forbidden", status: http.StatusForbidden, body: `{"code":"personal-team-blocked:spending-limit","error":"quota exhausted"}`},
+		{name: "unauthorized with matching text", status: http.StatusUnauthorized, body: `{"error":"Access to the chat endpoint is denied"}`},
+		{name: "rate limited", status: http.StatusTooManyRequests, body: `{"error":"Access to the chat endpoint is denied"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: test.status, Header: http.Header{}}
+			apiErr := parseAPIError(response, []byte(test.body))
+			if got := isPermanentAccountDenial(apiErr); got != test.want {
+				t.Fatalf("isPermanentAccountDenial() = %v, want %v; error=%#v", got, test.want, apiErr)
+			}
+		})
+	}
+}
+
 func TestRefreshModelsDiscoversEveryAccountAndPersistsCatalogs(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +149,61 @@ func TestRefreshModelsDiscoversEveryAccountAndPersistsCatalogs(t *testing.T) {
 		if len(raw["models"].([]any)) != 2 || raw["models_updated_at"] == "" {
 			t.Fatalf("credential model catalog was not persisted")
 		}
+	}
+}
+
+func TestRefreshModelsDisablesPermanentlyDeniedAccount(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer token-a":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":"Access to the chat endpoint is denied"}`)
+		case "Bearer token-b":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "grok-4"}}})
+		default:
+			t.Errorf("unexpected authorization header")
+		}
+	}))
+	defer upstream.Close()
+	dir := t.TempDir()
+	writeModelTestCredential(t, dir, "account-a.json", "subject-a", "token-a")
+	writeModelTestCredential(t, dir, "account-b.json", "subject-b", "token-b")
+	cfg := config.Config{
+		ChatProxyBaseURL: upstream.URL, ChatProxyVersion: "v1", AuthsDir: dir,
+		AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 2, ModelsRefreshInterval: 6 * time.Hour,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 1024,
+	}
+	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: dir, Surface: "tui", ReloadInterval: time.Hour, RefreshConcurrency: 2,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 1024,
+	}, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	client, err := NewClient(cfg, pool, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.RefreshModels(context.Background(), true); err == nil {
+		t.Fatal("partial model refresh unexpectedly succeeded")
+	}
+
+	available := 0
+	for _, id := range pool.AccountIDs() {
+		lease, err := pool.AcquireAccount(context.Background(), id)
+		if err != nil {
+			continue
+		}
+		available++
+		if lease.Session().Token != "token-b" {
+			t.Fatalf("denied credential remained available: %q", lease.Session().Token)
+		}
+		lease.Release()
+	}
+	if available != 1 {
+		t.Fatalf("available accounts=%d, want 1", available)
 	}
 }
 
