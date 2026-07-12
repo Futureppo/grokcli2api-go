@@ -78,18 +78,19 @@ If Docker and Docker Compose v2 are already installed on the server, run:
 bash <(curl -fsSL https://raw.githubusercontent.com/Futureppo/grokcli2api-go/main/scripts/deploy.sh)
 ```
 
-The script checks Docker, downloads the Compose configuration, creates a protected `.env` file and `auths/` directory, generates a random local API key, imports the OAuth JSON credential you select, and starts and verifies the service. Interactive runs prompt for the credential path. Existing installations retain their `.env` and credentials, so the same command also updates the container image.
+The script checks Docker, downloads the Compose configuration, creates a protected `.env` file and `auths/` directory, generates separate random local and administrator API keys, and starts and verifies the service. An interactive run can import an OAuth JSON file immediately or start with an empty credential pool so that a credential can be uploaded through the administrator API. Existing installations retain their `.env` and credentials, so the same command also updates the container image.
 
 For unattended deployment, provide the inputs as environment variables:
 
 ```bash
 AUTH_FILE=/root/account.json \
 GROK_API_KEYS='sk-change-this-to-a-strong-random-key' \
+GROK_ADMIN_KEY='adm-use-an-independent-strong-random-key' \
 INSTALL_DIR=/opt/grokcli2api-go \
 bash <(curl -fsSL https://raw.githubusercontent.com/Futureppo/grokcli2api-go/main/scripts/deploy.sh)
 ```
 
-Optional variables include `GROK2API_PORT` (default `8088`), `INSTALL_DIR` (default `~/grokcli2api-go`), `AUTH_FILE`, and `GROK_API_KEYS`. Without a credential, the script initializes the protected configuration but does not start a service that cannot handle requests.
+Optional variables include `GROK2API_PORT` (default `8088`), `INSTALL_DIR` (default `~/grokcli2api-go`), `AUTH_FILE`, `GROK_API_KEYS`, and `GROK_ADMIN_KEY`. The administrator API is enabled by default. Set `ENABLE_ADMIN_API=0` to disable it; without a local credential, that mode initializes the configuration without starting the service.
 
 > [!TIP]
 > The deployment script does not obtain upstream credentials for you. OAuth JSON is sensitive: export it only from a trusted source and store it with least-privilege permissions. Configure HTTPS, a reverse proxy, access controls, and rate limiting before exposing the service publicly.
@@ -99,7 +100,7 @@ Optional variables include `GROK2API_PORT` (default `8088`), `INSTALL_DIR` (defa
 You will need:
 
 - Docker and Docker Compose, or Go 1.23 or later;
-- at least one valid Grok CLI OAuth JSON credential; and
+- at least one valid Grok CLI OAuth JSON credential, or an administrator key for uploading one through the API; and
 - a writable credential directory.
 
 ```bash
@@ -291,6 +292,22 @@ curl http://localhost:8088/v1/admin/credentials \
 ```
 
 The server derives a redacted ID from the credential's stable account identity. Uploading the same account again atomically replaces its existing credential. Model discovery runs immediately after upload; a temporary discovery failure does not remove the saved credential.
+
+List redacted credential status:
+
+```bash
+curl http://localhost:8088/v1/admin/credentials \
+  -H "X-Admin-Key: $GROK_ADMIN_KEY"
+```
+
+Delete a credential using the 24-character redacted ID returned by the list endpoint:
+
+```bash
+curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
+  -H "X-Admin-Key: $GROK_ADMIN_KEY"
+```
+
+Administrator responses include `Cache-Control: no-store`. Uploads are limited to 1 MiB; the service validates the JSON, derives the destination from the account identity, and atomically writes it with mode `0600` instead of trusting the client filename. Prefer administration over loopback or an SSH tunnel. Cross-network access must use HTTPS with source and rate restrictions at the reverse proxy.
 
 ### Credential Pool and Scheduling
 

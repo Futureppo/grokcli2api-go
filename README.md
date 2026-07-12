@@ -78,18 +78,19 @@ flowchart LR
 bash <(curl -fsSL https://raw.githubusercontent.com/Futureppo/grokcli2api-go/main/scripts/deploy.sh)
 ```
 
-脚本会检查 Docker 环境、下载 Compose 配置、创建受保护的 `.env` 和 `auths/` 目录、生成随机本地 API Key、导入你指定的 OAuth JSON 凭证，并启动及验证服务。交互执行时按提示输入凭证文件路径即可；已有安装会保留 `.env` 与凭证，可用同一条命令完成镜像更新。
+脚本会检查 Docker 环境、下载 Compose 配置、创建受保护的 `.env` 和 `auths/` 目录，分别生成随机的本地 API Key 与管理员 Key，并启动及验证服务。交互执行时可以直接导入 OAuth JSON；也可以跳过本地文件，让服务以空凭证池启动，再通过管理员 API 远程上传。已有安装会保留 `.env` 与凭证，可用同一条命令完成镜像更新。
 
 无人值守部署可预先传入参数：
 
 ```bash
 AUTH_FILE=/root/account.json \
 GROK_API_KEYS='sk-change-this-to-a-strong-random-key' \
+GROK_ADMIN_KEY='adm-use-an-independent-strong-random-key' \
 INSTALL_DIR=/opt/grokcli2api-go \
 bash <(curl -fsSL https://raw.githubusercontent.com/Futureppo/grokcli2api-go/main/scripts/deploy.sh)
 ```
 
-可选变量包括 `GROK2API_PORT`（默认 `8088`）、`INSTALL_DIR`（默认 `~/grokcli2api-go`）、`AUTH_FILE` 与 `GROK_API_KEYS`。未提供凭证时，脚本只初始化安全配置而不会启动一个无法工作的服务。
+可选变量包括 `GROK2API_PORT`（默认 `8088`）、`INSTALL_DIR`（默认 `~/grokcli2api-go`）、`AUTH_FILE`、`GROK_API_KEYS` 与 `GROK_ADMIN_KEY`。管理员 API 默认启用；设置 `ENABLE_ADMIN_API=0` 可将其关闭，此时没有本地凭证则只初始化配置而不启动服务。
 
 > [!TIP]
 > 一键脚本解决的是服务部署，不会替你获取上游凭证。OAuth JSON 属于敏感信息，请只从可信来源导出，并在服务器上以最小权限保存。正式对公网开放前还应配置 HTTPS、反向代理、访问控制和限流。
@@ -99,7 +100,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Futureppo/grokcli2api-go/mai
 运行前需要：
 
 - Docker 与 Docker Compose，或 Go 1.23 及以上版本；
-- 至少一份有效的 Grok CLI OAuth JSON 凭证；
+- 至少一份有效的 Grok CLI OAuth JSON 凭证，或配置管理员 Key 后再通过 API 上传；
 - 一个可写的凭证目录。
 
 ```bash
@@ -291,6 +292,22 @@ curl http://localhost:8088/v1/admin/credentials \
 ```
 
 服务端根据凭证中的稳定账号标识生成脱敏 ID；重复上传同一账号会原子覆盖原凭证。上传后会立即尝试发现模型，临时探测失败不会删除已经保存的凭证。
+
+列出脱敏后的凭证状态：
+
+```bash
+curl http://localhost:8088/v1/admin/credentials \
+  -H "X-Admin-Key: $GROK_ADMIN_KEY"
+```
+
+删除凭证时使用列表返回的 24 位脱敏 ID：
+
+```bash
+curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
+  -H "X-Admin-Key: $GROK_ADMIN_KEY"
+```
+
+管理接口响应带有 `Cache-Control: no-store`。上传文件限制为 1 MiB，服务会校验 JSON、使用账号身份生成保存路径并以 `0600` 权限原子写入，不会采用客户端提供的文件名。建议优先在服务器本机或 SSH 隧道中管理；如需跨网络访问，必须使用 HTTPS，并在反向代理层限制来源和频率。
 
 ### 凭证池与调度
 
