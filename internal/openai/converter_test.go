@@ -13,6 +13,40 @@ func TestPrepareChatPreservesExtensions(t *testing.T) {
 	}
 }
 
+func TestPrepareChatStripsUnsupportedGrok45PresencePenalty(t *testing.T) {
+	body := map[string]any{
+		"model": "grok-4.5", "messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"presence_penalty": float64(0.5), "presencePenalty": float64(0.5),
+	}
+	out := PrepareChat(body)
+	if _, ok := out["presence_penalty"]; ok {
+		t.Fatal("presence_penalty was forwarded to grok-4.5")
+	}
+	if _, ok := out["presencePenalty"]; ok {
+		t.Fatal("presencePenalty was forwarded to grok-4.5")
+	}
+	if body["presence_penalty"] != float64(0.5) || body["presencePenalty"] != float64(0.5) {
+		t.Fatal("PrepareChat mutated the caller's request")
+	}
+
+	other := PrepareChat(map[string]any{"model": "grok-4", "presence_penalty": float64(0.5)})
+	if other["presence_penalty"] != float64(0.5) {
+		t.Fatal("presence_penalty should remain available to other models")
+	}
+}
+
+func TestPrepareChatStripsUnsupportedComposerPresencePenalty(t *testing.T) {
+	out := PrepareChat(map[string]any{
+		"model": "composer", "presence_penalty": float64(0.5), "presencePenalty": float64(0.5),
+	})
+	if _, ok := out["presence_penalty"]; ok {
+		t.Fatal("presence_penalty was forwarded to composer")
+	}
+	if _, ok := out["presencePenalty"]; ok {
+		t.Fatal("presencePenalty was forwarded to composer")
+	}
+}
+
 func TestPrepareResponsesPreservesModel(t *testing.T) {
 	body := map[string]any{"model": "grok-4.5", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "stream": true}
 	out := PrepareResponses(body)
@@ -24,6 +58,41 @@ func TestPrepareResponsesPreservesModel(t *testing.T) {
 	}
 	if _, ok := out["input"].([]any); !ok {
 		t.Fatalf("input = %#v", out["input"])
+	}
+}
+
+func TestPrepareResponsesStripsUnsupportedGrok45ExternalWebAccess(t *testing.T) {
+	body := map[string]any{
+		"model": "grok-4.5", "input": "hello",
+		"external_web_access": true, "externalWebAccess": true,
+	}
+	out := PrepareResponses(body)
+	if _, ok := out["external_web_access"]; ok {
+		t.Fatal("external_web_access was forwarded to grok-4.5")
+	}
+	if _, ok := out["externalWebAccess"]; ok {
+		t.Fatal("externalWebAccess was forwarded to grok-4.5")
+	}
+	if body["external_web_access"] != true || body["externalWebAccess"] != true {
+		t.Fatal("PrepareResponses mutated the caller's request")
+	}
+
+	other := PrepareResponses(map[string]any{"model": "grok-4", "input": "hello", "external_web_access": true})
+	if other["external_web_access"] != true {
+		t.Fatal("external_web_access should remain available to other models")
+	}
+}
+
+func TestPrepareResponsesStripsUnsupportedComposerExternalWebAccess(t *testing.T) {
+	out := PrepareResponses(map[string]any{
+		"model": "composer", "input": "hello",
+		"external_web_access": true, "externalWebAccess": true,
+	})
+	if _, ok := out["external_web_access"]; ok {
+		t.Fatal("external_web_access was forwarded to composer")
+	}
+	if _, ok := out["externalWebAccess"]; ok {
+		t.Fatal("externalWebAccess was forwarded to composer")
 	}
 }
 

@@ -68,6 +68,13 @@ func String(body map[string]any, key, fallback string) string {
 func PrepareChat(body map[string]any) map[string]any {
 	out := clone(body)
 	out["stream"] = IsStreaming(body)
+	if rejectsCompatibilityParameters(body) {
+		// These models reject the OpenAI sampling penalty, while older
+		// upstream models may still accept it. Handle both spellings so
+		// OpenAI-compatible and direct clients behave consistently.
+		delete(out, "presence_penalty")
+		delete(out, "presencePenalty")
+	}
 	return out
 }
 
@@ -77,6 +84,12 @@ func PrepareResponses(body map[string]any) map[string]any {
 	out := clone(body)
 	out["model"] = UpstreamModel(String(body, "model", ""))
 	out["stream"] = IsStreaming(body)
+	if rejectsCompatibilityParameters(body) {
+		// Codex clients may send this extension, but these models do not
+		// expose the corresponding Responses API argument.
+		delete(out, "external_web_access")
+		delete(out, "externalWebAccess")
+	}
 	if _, ok := out["input"]; !ok {
 		if messages, legacy := out["messages"]; legacy {
 			out["input"] = messages
@@ -103,6 +116,15 @@ func PrepareResponses(body map[string]any) map[string]any {
 		out["store"] = false
 	}
 	return out
+}
+
+func rejectsCompatibilityParameters(body map[string]any) bool {
+	switch strings.ToLower(strings.TrimSpace(String(body, "model", ""))) {
+	case "grok-4.5", "composer":
+		return true
+	default:
+		return false
+	}
 }
 
 func responsesTextFormat(value any) any {
