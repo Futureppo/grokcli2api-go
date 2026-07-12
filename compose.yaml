@@ -1,8 +1,7 @@
 services:
   grokcli2api:
-    image: ${GROK2API_IMAGE:-grokcli2api-go:local}
-    build:
-      context: .
+    image: ghcr.io/futureppo/grokcli2api-go:latest
+    pull_policy: always
     restart: unless-stopped
     env_file:
       - path: .env
