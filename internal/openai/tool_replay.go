@@ -20,8 +20,16 @@ type ToolReplayCache struct {
 }
 
 type toolReplayEntry struct {
-	items     []map[string]any
-	expiresAt time.Time
+	items      []map[string]any
+	store      bool
+	storeKnown bool
+	expiresAt  time.Time
+}
+
+type toolReplayRecord struct {
+	items      []map[string]any
+	store      bool
+	storeKnown bool
 }
 
 const (
@@ -51,26 +59,38 @@ func toolReplayKey(model, key string) string {
 }
 
 func (c *ToolReplayCache) Get(model, key string) []map[string]any {
-	if c == nil || model == "" || key == "" {
+	record, ok := c.getRecord(model, key)
+	if !ok {
 		return nil
+	}
+	return record.items
+}
+
+func (c *ToolReplayCache) getRecord(model, key string) (toolReplayRecord, bool) {
+	if c == nil || model == "" || key == "" {
+		return toolReplayRecord{}, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.entries[toolReplayKey(model, key)]
 	if !ok {
-		return nil
+		return toolReplayRecord{}, false
 	}
 	if time.Now().After(entry.expiresAt) {
 		delete(c.entries, toolReplayKey(model, key))
-		return nil
+		return toolReplayRecord{}, false
 	}
 	// Sliding TTL: each successful read refreshes the entry expiry.
 	entry.expiresAt = time.Now().Add(c.ttl)
 	c.entries[toolReplayKey(model, key)] = entry
-	return cloneToolReplayItems(entry.items)
+	return toolReplayRecord{items: cloneToolReplayItems(entry.items), store: entry.store, storeKnown: entry.storeKnown}, true
 }
 
 func (c *ToolReplayCache) Put(model, key string, items []map[string]any) {
+	c.put(model, key, items, false, false)
+}
+
+func (c *ToolReplayCache) put(model, key string, items []map[string]any, store, storeKnown bool) {
 	if c == nil || model == "" || key == "" || len(items) == 0 {
 		return
 	}
@@ -90,8 +110,10 @@ func (c *ToolReplayCache) Put(model, key string, items []map[string]any) {
 		}
 	}
 	c.entries[toolReplayKey(model, key)] = toolReplayEntry{
-		items:     cloneToolReplayItems(normalized),
-		expiresAt: time.Now().Add(c.ttl),
+		items:      cloneToolReplayItems(normalized),
+		store:      store,
+		storeKnown: storeKnown,
+		expiresAt:  time.Now().Add(c.ttl),
 	}
 }
 
@@ -173,6 +195,13 @@ func normalizeReplayItems(items []map[string]any) []map[string]any {
 //   - cache:{prompt_cache_key} when present
 //   - item:{item.id} for each tool call
 func RememberCompletedResponse(cache *ToolReplayCache, model string, response map[string]any, promptCacheKey string) {
+	RememberCompletedResponseWithStore(cache, model, response, promptCacheKey, false)
+}
+
+// RememberCompletedResponseWithStore also records whether the upstream can
+// restore the response. Only store:false responses are eligible for local
+// minimal tool-call replay.
+func RememberCompletedResponseWithStore(cache *ToolReplayCache, model string, response map[string]any, promptCacheKey string, store bool) {
 	if cache == nil || response == nil || strings.TrimSpace(model) == "" {
 		return
 	}
@@ -182,14 +211,14 @@ func RememberCompletedResponse(cache *ToolReplayCache, model string, response ma
 	}
 	responseID := String(response, "id", "")
 	if responseID != "" {
-		cache.Put(model, "prev-resp:"+responseID, items)
+		cache.put(model, "prev-resp:"+responseID, items, store, true)
 	}
 	if promptCacheKey = strings.TrimSpace(promptCacheKey); promptCacheKey != "" {
-		cache.Put(model, "cache:"+promptCacheKey, items)
+		cache.put(model, "cache:"+promptCacheKey, items, store, true)
 	}
 	for _, item := range items {
 		if id := String(item, "id", ""); id != "" {
-			cache.Put(model, "item:"+id, []map[string]any{item})
+			cache.put(model, "item:"+id, []map[string]any{item}, store, true)
 		}
 	}
 }
@@ -199,6 +228,10 @@ func RememberCompletedResponse(cache *ToolReplayCache, model string, response ma
 // patching empty output; item:{id} is safe to write immediately so
 // item_reference works mid-stream.
 func RememberStreamToolCall(cache *ToolReplayCache, model string, item map[string]any, responseID, promptCacheKey string) {
+	RememberStreamToolCallWithStore(cache, model, item, responseID, promptCacheKey, false)
+}
+
+func RememberStreamToolCallWithStore(cache *ToolReplayCache, model string, item map[string]any, responseID, promptCacheKey string, store bool) {
 	if cache == nil || item == nil || strings.TrimSpace(model) == "" {
 		return
 	}
@@ -207,14 +240,14 @@ func RememberStreamToolCall(cache *ToolReplayCache, model string, item map[strin
 		return
 	}
 	if responseID = strings.TrimSpace(responseID); responseID != "" {
-		cache.Put(model, "prev-resp:"+responseID, mergeReplayItems(cache.Get(model, "prev-resp:"+responseID), items))
+		cache.put(model, "prev-resp:"+responseID, mergeReplayItems(cache.Get(model, "prev-resp:"+responseID), items), store, true)
 	}
 	if promptCacheKey = strings.TrimSpace(promptCacheKey); promptCacheKey != "" {
-		cache.Put(model, "cache:"+promptCacheKey, mergeReplayItems(cache.Get(model, "cache:"+promptCacheKey), items))
+		cache.put(model, "cache:"+promptCacheKey, mergeReplayItems(cache.Get(model, "cache:"+promptCacheKey), items), store, true)
 	}
 	for _, normalized := range items {
 		if id := String(normalized, "id", ""); id != "" {
-			cache.Put(model, "item:"+id, []map[string]any{normalized})
+			cache.put(model, "item:"+id, []map[string]any{normalized}, store, true)
 		}
 	}
 }
@@ -312,13 +345,13 @@ func expandItemReferences(cache *ToolReplayCache, model string, input []any) []a
 
 // applyToolCallReplay re-inserts cached function/custom calls for matching
 // tool outputs from previous_response_id / prompt_cache_key sessions.
-func applyToolCallReplay(cache *ToolReplayCache, model string, body map[string]any, previousResponseID, promptCacheKey string) {
+func applyToolCallReplay(cache *ToolReplayCache, model string, body map[string]any, previousResponseID, promptCacheKey string) bool {
 	if cache == nil {
-		return
+		return false
 	}
 	input, ok := body["input"].([]any)
 	if !ok || len(input) == 0 {
-		return
+		return false
 	}
 
 	// Collect existing calls and outputs already present in the request input.
@@ -342,19 +375,22 @@ func applyToolCallReplay(cache *ToolReplayCache, model string, body map[string]a
 		}
 	}
 	if len(existingOutputs) == 0 {
-		return
+		return false
 	}
 
 	// Prefer previous_response_id session, then prompt_cache_key session.
 	var candidates []map[string]any
 	if previousResponseID != "" {
-		candidates = append(candidates, cache.Get(model, "prev-resp:"+previousResponseID)...)
-	}
-	if promptCacheKey != "" {
+		record, found := cache.getRecord(model, "prev-resp:"+previousResponseID)
+		if !found || !record.storeKnown || record.store {
+			return false
+		}
+		candidates = append(candidates, record.items...)
+	} else if promptCacheKey != "" {
 		candidates = append(candidates, cache.Get(model, "cache:"+promptCacheKey)...)
 	}
 	if len(candidates) == 0 {
-		return
+		return false
 	}
 
 	// Filter: only function/custom calls whose call_id has a matching output
@@ -384,7 +420,19 @@ func applyToolCallReplay(cache *ToolReplayCache, model string, body map[string]a
 		filtered = append(filtered, clone(item))
 	}
 	if len(filtered) == 0 {
-		return
+		// Calls may already be included by the client. This is still a
+		// complete stateless continuation when every output is matched.
+		for callID := range existingOutputs {
+			if _, ok := existingCalls[callID]; !ok {
+				return false
+			}
+		}
+		return true
+	}
+	for callID := range existingOutputs {
+		if _, ok := existingCalls[callID]; !ok {
+			return false
+		}
 	}
 
 	// Insert immediately before the first matching tool output.
@@ -422,53 +470,5 @@ func applyToolCallReplay(cache *ToolReplayCache, model string, body map[string]a
 	rewritten = append(rewritten, missing...)
 	rewritten = append(rewritten, input[insertAt:]...)
 	body["input"] = rewritten
-}
-
-// pruneOrphanToolOutputs drops tool outputs whose call_id has no matching call.
-func pruneOrphanToolOutputs(body map[string]any) {
-	input, ok := body["input"].([]any)
-	if !ok || len(input) == 0 {
-		return
-	}
-	calls := make(map[string]struct{})
-	for _, raw := range input {
-		item, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		switch String(item, "type", "") {
-		case "function_call", "custom_tool_call":
-			if callID := strings.TrimSpace(String(item, "call_id", "")); callID != "" {
-				calls[callID] = struct{}{}
-			}
-		}
-	}
-	var out []any
-	for index, raw := range input {
-		item, ok := raw.(map[string]any)
-		if !ok {
-			if out != nil {
-				out = append(out, raw)
-			}
-			continue
-		}
-		switch String(item, "type", "") {
-		case "function_call_output", "custom_tool_call_output":
-			callID := strings.TrimSpace(String(item, "call_id", ""))
-			_, matched := calls[callID]
-			if callID == "" || !matched {
-				if out == nil {
-					out = make([]any, 0, len(input))
-					out = append(out, input[:index]...)
-				}
-				continue
-			}
-		}
-		if out != nil {
-			out = append(out, raw)
-		}
-	}
-	if out != nil {
-		body["input"] = out
-	}
+	return true
 }

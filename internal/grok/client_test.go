@@ -79,6 +79,14 @@ func TestPermanentAccountDenialDetection(t *testing.T) {
 	}
 }
 
+func TestParseAPIErrorPreservesParameter(t *testing.T) {
+	response := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}}
+	err := parseAPIError(response, []byte(`{"error":{"type":"invalid_request_error","code":"invalid_value","message":"bad","param":"input[0]"}}`))
+	if err.UpstreamCode != "invalid_value" || err.UpstreamMessage != "bad" || err.UpstreamParam != "input[0]" {
+		t.Fatalf("parsed error = %#v", err)
+	}
+}
+
 func TestFreeModelQuotaDetection(t *testing.T) {
 	tests := []struct {
 		name   string

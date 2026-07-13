@@ -32,9 +32,13 @@ func (t toolIdentity) key() string {
 // ResponsesCompatibility contains only request-local mappings. It is safe to
 // create one per request and intentionally has no process-global state.
 type ResponsesCompatibility struct {
-	aliases         map[string]toolIdentity
-	originalAliases map[string]string
-	streamCalls     map[string]*streamToolCall
+	aliases                  map[string]toolIdentity
+	originalAliases          map[string]string
+	streamCalls              map[string]*streamToolCall
+	publicModel              string
+	previousResponseID       string
+	localReplay              bool
+	continuationInstructions any
 }
 
 type streamToolCall struct {
@@ -74,16 +78,23 @@ func PrepareCompatibleResponses(body map[string]any) (map[string]any, *Responses
 func PrepareCompatibleResponsesWithCache(body map[string]any, cache *ToolReplayCache) (map[string]any, *ResponsesCompatibility, error) {
 	out := PrepareResponses(body)
 	removeEncryptedReasoningInclude(out)
-	// Grok CLI has no previous_response_id; affinity/replay consume it first.
 	previousResponseID := String(body, "previous_response_id", "")
 	promptCacheKey := String(body, "prompt_cache_key", "")
-	delete(out, "previous_response_id")
 	model := String(body, "model", "")
 
 	compat := &ResponsesCompatibility{
-		aliases:         make(map[string]toolIdentity),
-		originalAliases: make(map[string]string),
-		streamCalls:     make(map[string]*streamToolCall),
+		aliases:            make(map[string]toolIdentity),
+		originalAliases:    make(map[string]string),
+		streamCalls:        make(map[string]*streamToolCall),
+		publicModel:        model,
+		previousResponseID: previousResponseID,
+	}
+	if previousResponseID != "" {
+		if instructions, exists := out["instructions"]; exists {
+			compat.continuationInstructions = instructions
+			delete(out, "instructions")
+			prependContinuationInstructions(out, instructions)
+		}
 	}
 
 	sources := make([]toolSource, 0)
@@ -94,9 +105,20 @@ func PrepareCompatibleResponsesWithCache(body map[string]any, cache *ToolReplayC
 	}
 
 	if input, ok := out["input"].([]any); ok {
-		input = expandItemReferences(cache, model, input)
+		statefulPrevious := false
+		if previousResponseID != "" {
+			if record, found := cache.getRecord(model, "prev-resp:"+previousResponseID); found && record.storeKnown && record.store {
+				statefulPrevious = true
+			}
+		}
+		if !statefulPrevious {
+			input = expandItemReferences(cache, model, input)
+		}
 		probe := map[string]any{"input": input}
-		applyToolCallReplay(cache, model, probe, previousResponseID, promptCacheKey)
+		compat.localReplay = applyToolCallReplay(cache, model, probe, previousResponseID, promptCacheKey)
+		if compat.localReplay && previousResponseID != "" {
+			delete(out, "previous_response_id")
+		}
 		input, _ = probe["input"].([]any)
 
 		rewritten, extra, err := compat.normalizeInputList(input)
@@ -105,7 +127,11 @@ func PrepareCompatibleResponsesWithCache(body map[string]any, cache *ToolReplayC
 		}
 		sources = append(sources, extra...)
 		out["input"] = rewritten
-		pruneOrphanToolOutputs(out)
+		if _, forwardingPrevious := out["previous_response_id"]; !forwardingPrevious {
+			if err := validateNormalizedToolOutputs(out); err != nil {
+				return nil, nil, err
+			}
+		}
 	}
 
 	tools, err := compat.normalizeToolSources(sources)
@@ -138,7 +164,7 @@ func (c *ResponsesCompatibility) normalizeInputList(input []any) ([]any, []toolS
 func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []toolSource, error) {
 	item, ok := raw.(map[string]any)
 	if !ok {
-		return raw, nil, nil
+		return nil, nil, invalidRequest(fmt.Sprintf("input[%d]", index), fmt.Sprintf("input[%d] must be an object", index))
 	}
 	kind := String(item, "type", "")
 	if kind == "" {
@@ -256,10 +282,7 @@ func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []
 	case "compaction_trigger":
 		return nil, nil, nil
 	default:
-		// New Codex clients can add optional history item types before the
-		// Grok CLI endpoint supports them. Omitting an unknown optional item
-		// is preferable to rejecting the whole turn.
-		return nil, nil, nil
+		return nil, nil, unsupportedRequest(fmt.Sprintf("input[%d].type", index), "unsupported input item type: "+kind)
 	}
 }
 
@@ -686,7 +709,14 @@ func (c *ResponsesCompatibility) NormalizeResponse(raw map[string]any, fallbackM
 	if c == nil {
 		return out
 	}
-	return c.rewriteValue(out).(map[string]any)
+	out = c.rewriteValue(out).(map[string]any)
+	if c.localReplay && c.previousResponseID != "" && out["previous_response_id"] == nil {
+		out["previous_response_id"] = c.previousResponseID
+	}
+	if c.continuationInstructions != nil {
+		out["instructions"] = c.continuationInstructions
+	}
+	return out
 }
 
 func (c *ResponsesCompatibility) rewriteValue(value any) any {
@@ -820,13 +850,83 @@ func (c *ResponsesCompatibility) TranslateStream(event string, data []byte) ([]S
 		payload = c.rewriteValue(payload).(map[string]any)
 	}
 	if response, ok := payload["response"].(map[string]any); ok {
-		payload["response"] = filterResponseObject(response)
+		response = normalizeResponseObject(response)
+		if c.publicModel != "" {
+			response["model"] = c.publicModel
+		}
+		if c.localReplay && c.previousResponseID != "" && response["previous_response_id"] == nil {
+			response["previous_response_id"] = c.previousResponseID
+		}
+		if c.continuationInstructions != nil {
+			response["instructions"] = c.continuationInstructions
+		}
+		payload["response"] = response
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 	return []StreamEvent{{Event: String(payload, "type", event), Data: encoded}}, nil
+}
+
+func prependContinuationInstructions(body map[string]any, instructions any) {
+	text, ok := instructions.(string)
+	if !ok || text == "" {
+		return
+	}
+	developer := map[string]any{
+		"type": "message", "role": "developer",
+		"content": []any{map[string]any{"type": "input_text", "text": text}},
+	}
+	switch input := body["input"].(type) {
+	case string:
+		body["input"] = []any{
+			developer,
+			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": input}}},
+		}
+	case []any:
+		rewritten := make([]any, 0, len(input)+1)
+		rewritten = append(rewritten, developer)
+		rewritten = append(rewritten, input...)
+		body["input"] = rewritten
+	}
+}
+
+func validateNormalizedToolOutputs(body map[string]any) error {
+	input, ok := body["input"].([]any)
+	if !ok {
+		return nil
+	}
+	calls := make(map[string]struct{})
+	for _, raw := range input {
+		item, _ := raw.(map[string]any)
+		switch String(item, "type", "") {
+		case "function_call", "custom_tool_call":
+			if callID := strings.TrimSpace(String(item, "call_id", "")); callID != "" {
+				calls[callID] = struct{}{}
+			}
+		}
+	}
+	seenOutputs := make(map[string]struct{})
+	for index, raw := range input {
+		item, _ := raw.(map[string]any)
+		switch String(item, "type", "") {
+		case "function_call_output", "custom_tool_call_output":
+			callID := strings.TrimSpace(String(item, "call_id", ""))
+			path := fmt.Sprintf("input[%d].call_id", index)
+			if callID == "" {
+				return invalidRequest(path, path+" is required")
+			}
+			if _, duplicate := seenOutputs[callID]; duplicate {
+				return invalidRequest(path, "duplicate tool output for call_id: "+callID)
+			}
+			seenOutputs[callID] = struct{}{}
+			if _, matched := calls[callID]; !matched {
+				return invalidRequest(path, "tool output has no matching call_id: "+callID)
+			}
+		}
+	}
+	return nil
 }
 
 func (c *ResponsesCompatibility) streamIdentity(payload map[string]any) (toolIdentity, *streamToolCall, bool) {

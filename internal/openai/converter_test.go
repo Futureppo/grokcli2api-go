@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -81,6 +82,17 @@ func TestPrepareResponsesPreservesModel(t *testing.T) {
 	}
 	if _, ok := out["input"].([]any); !ok {
 		t.Fatalf("input = %#v", out["input"])
+	}
+}
+
+func TestPrepareResponsesDefaultsStoreToTrue(t *testing.T) {
+	defaulted := PrepareResponses(map[string]any{"model": "grok-4.5", "input": "hello"})
+	if defaulted["store"] != true {
+		t.Fatalf("default store = %#v, want true", defaulted["store"])
+	}
+	explicit := PrepareResponses(map[string]any{"model": "grok-4.5", "input": "hello", "store": false})
+	if explicit["store"] != false {
+		t.Fatalf("explicit store = %#v, want false", explicit["store"])
 	}
 }
 
@@ -214,6 +226,75 @@ func TestNormalizeResponseDoesNotCreateChatEnvelope(t *testing.T) {
 	}
 	if _, exists := out["grok_extension"]; exists {
 		t.Fatal("Grok-native response field leaked into the default OpenAI response")
+	}
+}
+
+func TestNormalizeResponseUsesRequestedModelAndSanitizesUsage(t *testing.T) {
+	out := NormalizeResponse(map[string]any{
+		"model":   "grok-4.5-build-free",
+		"billing": map[string]any{"cost_in_usd_ticks": float64(12)},
+		"usage": map[string]any{
+			"input_tokens": float64(10),
+			"input_tokens_details": map[string]any{
+				"cached_tokens": float64(3), "context_details": map[string]any{"x": true},
+			},
+			"output_tokens": float64(4),
+			"output_tokens_details": map[string]any{
+				"reasoning_tokens": float64(2), "num_server_side_tools_used": float64(1),
+			},
+			"total_tokens": float64(14), "cost_in_usd_ticks": float64(12), "num_sources_used": float64(2),
+		},
+	}, "grok-4.5")
+	if out["model"] != "grok-4.5" {
+		t.Fatalf("model = %#v", out["model"])
+	}
+	if _, ok := out["billing"]; ok {
+		t.Fatalf("billing leaked: %#v", out)
+	}
+	usage := out["usage"].(map[string]any)
+	if len(usage) != 5 || usage["cost_in_usd_ticks"] != nil || usage["num_sources_used"] != nil {
+		t.Fatalf("usage = %#v", usage)
+	}
+	inputDetails := usage["input_tokens_details"].(map[string]any)
+	if len(inputDetails) != 1 || inputDetails["cached_tokens"] != float64(3) {
+		t.Fatalf("input token details = %#v", inputDetails)
+	}
+	outputDetails := usage["output_tokens_details"].(map[string]any)
+	if len(outputDetails) != 1 || outputDetails["reasoning_tokens"] != float64(2) {
+		t.Fatalf("output token details = %#v", outputDetails)
+	}
+}
+
+func TestValidateResponsesRequestReportsPreciseParameters(t *testing.T) {
+	tests := []struct {
+		name  string
+		body  map[string]any
+		param string
+		code  string
+	}{
+		{name: "previous response", body: map[string]any{"model": "grok-4.5", "input": "x", "previous_response_id": 1}, param: "previous_response_id"},
+		{name: "image url", body: map[string]any{"model": "grok-4.5", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "x"}, map[string]any{"type": "input_image", "image_url": "data:image/png;base64,%%%"}}}}}, param: "input[0].content[1].image_url"},
+		{name: "image detail", body: map[string]any{"model": "grok-4.5", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_image", "image_url": "https://example.com/a.png", "detail": "giant"}}}}}, param: "input[0].content[0].detail"},
+		{name: "file id", body: map[string]any{"model": "grok-4.5", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_image", "file_id": "file_1"}}}}}, param: "input[0].content[0].file_id", code: "unsupported_parameter"},
+		{name: "function parameters", body: map[string]any{"model": "grok-4.5", "input": "x", "tools": []any{map[string]any{"type": "function", "name": "f", "parameters": "bad"}}}, param: "tools[0].parameters"},
+		{name: "orphan output", body: map[string]any{"model": "grok-4.5", "input": []any{map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "x"}}}, param: "input[0].call_id"},
+		{name: "unsupported conversation", body: map[string]any{"model": "grok-4.5", "input": "x", "conversation": "conv_1"}, param: "conversation", code: "unsupported_parameter"},
+		{name: "unknown field", body: map[string]any{"model": "grok-4.5", "input": "x", "future_option": true}, param: "future_option", code: "unsupported_parameter"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateResponsesRequest(test.body, false)
+			var requestErr *RequestError
+			if !errors.As(err, &requestErr) {
+				t.Fatalf("error = %#v", err)
+			}
+			if requestErr.Param != test.param {
+				t.Fatalf("param = %q, want %q", requestErr.Param, test.param)
+			}
+			if test.code != "" && requestErr.Code != test.code {
+				t.Fatalf("code = %q, want %q", requestErr.Code, test.code)
+			}
+		})
 	}
 }
 

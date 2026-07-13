@@ -22,6 +22,7 @@ import (
 
 	"github.com/Futureppo/grokcli2api-go/internal/auth"
 	"github.com/Futureppo/grokcli2api-go/internal/config"
+	"github.com/Futureppo/grokcli2api-go/internal/openai"
 )
 
 func TestRootServiceInfo(t *testing.T) {
@@ -731,15 +732,20 @@ func TestResponsesDefaultsToOpenAIFormat(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if body["input"] != "hello" || body["model"] != "grok-4" || body["store"] != false || body["grok_extension"] != nil {
+		if body["input"] != "hello" || body["model"] != "grok-4" || body["store"] != true || body["grok_extension"] != nil {
 			t.Fatalf("wire=%#v", body)
 		}
-		writeJSON(w, 200, map[string]any{"id": "resp_1", "object": "response", "status": "completed", "output": []any{}, "grok_field": "hidden"})
+		writeJSON(w, 200, map[string]any{
+			"id": "resp_1", "object": "response", "status": "completed", "model": "grok-4-build-free", "output": []any{},
+			"billing":    map[string]any{"cost_in_usd_ticks": 9},
+			"usage":      map[string]any{"input_tokens": 2, "output_tokens": 1, "total_tokens": 3, "cost_in_usd_ticks": 9},
+			"grok_field": "hidden",
+		})
 	}))
 	defer upstream.Close()
 	h := newTestHandler(t, upstream.URL, nil)
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"hello","grok_extension":"drop"}`)))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"hello"}`)))
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -753,6 +759,90 @@ func TestResponsesDefaultsToOpenAIFormat(t *testing.T) {
 	}
 	if _, exists := response["grok_field"]; exists {
 		t.Fatalf("Grok-native field leaked into default response: %#v", response)
+	}
+	if _, exists := response["billing"]; exists {
+		t.Fatalf("billing leaked into default response: %#v", response)
+	}
+	if usage := response["usage"].(map[string]any); len(usage) != 3 || usage["cost_in_usd_ticks"] != nil {
+		t.Fatalf("usage=%#v", usage)
+	}
+}
+
+func TestResponsesForwardsPreviousResponseID(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["previous_response_id"] != "resp_parent" || body["store"] != true {
+			t.Fatalf("wire=%#v", body)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": "resp_child", "previous_response_id": "resp_parent", "output": []any{}})
+	}))
+	defer upstream.Close()
+	h := newTestHandler(t, upstream.URL, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"continue","previous_response_id":"resp_parent"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResponsesStoreAwareToolContinuationWireBodies(t *testing.T) {
+	tests := []struct {
+		name          string
+		responseID    string
+		store         bool
+		wantPrevious  bool
+		wantInputSize int
+	}{
+		{name: "stored", responseID: "resp_wire_stored", store: true, wantPrevious: true, wantInputSize: 1},
+		{name: "stateless", responseID: "resp_wire_stateless", store: false, wantInputSize: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			callID := "call_" + test.name
+			openai.RememberCompletedResponseWithStore(openai.DefaultToolReplay, "grok-4", map[string]any{
+				"id": test.responseID, "output": []any{map[string]any{
+					"id": "fc_" + test.name, "type": "function_call", "call_id": callID, "name": "lookup", "arguments": `{}`,
+				}},
+			}, "", test.store)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				_, hasPrevious := body["previous_response_id"]
+				if hasPrevious != test.wantPrevious {
+					t.Fatalf("wire previous=%t body=%#v", hasPrevious, body)
+				}
+				input := body["input"].([]any)
+				if len(input) != test.wantInputSize {
+					t.Fatalf("wire input=%#v", input)
+				}
+				if !test.store && openai.String(input[0].(map[string]any), "type", "") != "function_call" {
+					t.Fatalf("stateless call was not replayed: %#v", input)
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"id": "resp_next_" + test.name, "output": []any{}})
+			}))
+			defer upstream.Close()
+			h := newTestHandler(t, upstream.URL, nil)
+			rec := httptest.NewRecorder()
+			requestBody := fmt.Sprintf(`{"model":"grok-4","previous_response_id":%q,"input":[{"type":"function_call_output","call_id":%q,"output":"ok"}]}`, test.responseID, callID)
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(requestBody)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if !test.store {
+				var response map[string]any
+				if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if response["previous_response_id"] != test.responseID {
+					t.Fatalf("response previous=%#v", response["previous_response_id"])
+				}
+			}
+		})
 	}
 }
 
@@ -793,26 +883,26 @@ func TestResponsesConvertsNamespaceToolsAndRestoresCall(t *testing.T) {
 	}
 }
 
-func TestResponsesDropsUnknownInputBeforeUpstream(t *testing.T) {
+func TestResponsesRejectsUnknownInputBeforeUpstream(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatal(err)
-		}
-		if input := body["input"].([]any); len(input) != 0 {
-			t.Fatalf("input=%#v", input)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"output": []any{}})
+		t.Fatal("invalid request reached upstream")
 	}))
 	defer upstream.Close()
 	h := newTestHandler(t, upstream.URL, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":[{"type":"future_item"}]}`)))
-	if rec.Code != http.StatusOK || calls.Load() != 1 {
+	if rec.Code != http.StatusBadRequest || calls.Load() != 0 {
 		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	inner := payload["error"].(map[string]any)
+	if inner["param"] != "input[0].type" || inner["type"] != "invalid_request_error" {
+		t.Fatalf("error=%#v", inner)
 	}
 }
 
@@ -904,6 +994,57 @@ func TestResponsesStreamPreservesEventsWithoutDone(t *testing.T) {
 	}
 	if strings.Contains(text, "grok.custom") {
 		t.Fatalf("Grok-native event leaked into default stream: %s", text)
+	}
+}
+
+func TestResponsesStreamEmitsErrorOnPrematureEOF(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cut\",\"model\":\"grok-4-build-free\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n")
+	}))
+	defer upstream.Close()
+	h := newTestHandler(t, upstream.URL, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"hello","stream":true}`)))
+	text := rec.Body.String()
+	if !strings.Contains(text, "event: error") || !strings.Contains(text, `"type":"error"`) || !strings.Contains(text, "stream ended before a terminal event") {
+		t.Fatalf("missing premature EOF error: %s", text)
+	}
+}
+
+func TestResponsesValidationUses400AndPreciseParam(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("invalid request reached upstream")
+	}))
+	defer upstream.Close()
+	h := newTestHandler(t, upstream.URL, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"look"},{"type":"input_image","image_url":"http://example.com/a.png"}]}]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	inner := payload["error"].(map[string]any)
+	if inner["param"] != "input[0].content[1].image_url" || inner["code"] != "invalid_value" {
+		t.Fatalf("error=%#v", inner)
+	}
+}
+
+func TestResponsesOversizedBodyUses413(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("oversized request reached upstream")
+	}))
+	defer upstream.Close()
+	h := newTestHandler(t, upstream.URL, nil)
+	body := `{"model":"grok-4","input":"` + strings.Repeat("x", (16<<20)+1) + `"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1359,20 +1500,27 @@ func TestAffinityInputPrecedenceAndOpaqueConversationID(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	req.Header.Set("X-Grok-Session-ID", "secret-session")
-	if got := requestAffinity(req, body); got.Key != "session:secret-session" || got.Mode != auth.AffinityHard {
+	if got := requestAffinity(req, body); got.Key != "previous:resp" || got.Mode != auth.AffinityHard {
+		t.Fatalf("previous response affinity = %q", got)
+	}
+	withoutPrevious := map[string]any{
+		"prompt_cache_key": "cache", "user": "user",
+		"metadata": map[string]any{"user_id": "metadata-user"},
+	}
+	if got := requestAffinity(req, withoutPrevious); got.Key != "session:secret-session" || got.Mode != auth.AffinityHard {
 		t.Fatalf("header affinity = %q", got)
 	}
-	conv := conversationID(requestAffinity(req, body))
+	conv := conversationID(requestAffinity(req, withoutPrevious))
 	if conv == "" || strings.Contains(conv, "secret-session") || conv != conversationID(auth.Affinity{Key: "session:secret-session", Mode: auth.AffinityHard}) {
 		t.Fatalf("conversation id is not stable and opaque: %q", conv)
 	}
 	req.Header.Del("X-Grok-Session-ID")
-	if got := requestAffinity(req, body); got.Key != "cache:cache" || got.Mode != auth.AffinitySoft {
-		t.Fatalf("prompt cache affinity = %q", got)
-	}
-	delete(body, "prompt_cache_key")
 	if got := requestAffinity(req, body); got.Key != "previous:resp" || got.Mode != auth.AffinityHard {
 		t.Fatalf("previous response affinity = %q", got)
+	}
+	delete(body, "previous_response_id")
+	if got := requestAffinity(req, body); got.Key != "cache:cache" || got.Mode != auth.AffinitySoft {
+		t.Fatalf("prompt cache affinity = %q", got)
 	}
 }
 

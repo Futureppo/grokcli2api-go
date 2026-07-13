@@ -46,6 +46,7 @@ type APIError struct {
 	RequestID       string
 	UpstreamCode    string
 	UpstreamMessage string
+	UpstreamParam   string
 	RetryAfter      time.Duration
 }
 
@@ -907,6 +908,10 @@ func parseAPIError(resp *http.Response, body []byte) *APIError {
 			if e.UpstreamMessage == "" {
 				e.UpstreamMessage, _ = inner["message"].(string)
 			}
+			e.UpstreamParam, _ = inner["param"].(string)
+		}
+		if e.UpstreamParam == "" {
+			e.UpstreamParam, _ = parsed["param"].(string)
 		}
 		if e.UpstreamMessage == "" {
 			e.UpstreamMessage, _ = parsed["message"].(string)

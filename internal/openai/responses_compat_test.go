@@ -2,6 +2,7 @@ package openai
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -103,26 +104,15 @@ func TestPrepareCompatibleResponsesRewritesCodexInputItems(t *testing.T) {
 	}
 }
 
-func TestPrepareCompatibleResponsesDropsUnknownInput(t *testing.T) {
-	wire, _, err := PrepareCompatibleResponses(map[string]any{
+func TestPrepareCompatibleResponsesRejectsUnknownInput(t *testing.T) {
+	_, _, err := PrepareCompatibleResponses(map[string]any{
 		"model": "grok-4.5", "input": []any{
 			map[string]any{"type": "future_item"},
-			map[string]any{"type": "message", "role": "user", "phase": "commentary", "internal_chat_message_metadata_passthrough": map[string]any{"turn_id": "turn-1"}, "content": []any{map[string]any{"type": "input_text", "text": "hello"}}},
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	input := wire["input"].([]any)
-	if len(input) != 1 {
-		t.Fatalf("input = %#v", input)
-	}
-	message := input[0].(map[string]any)
-	if _, ok := message["phase"]; ok {
-		t.Fatalf("phase leaked upstream: %#v", message)
-	}
-	if _, ok := message["internal_chat_message_metadata_passthrough"]; ok {
-		t.Fatalf("internal metadata leaked upstream: %#v", message)
+	var requestErr *RequestError
+	if !errors.As(err, &requestErr) || requestErr.Param != "input[0].type" {
+		t.Fatalf("error = %#v", err)
 	}
 }
 
@@ -146,6 +136,30 @@ func TestPrepareCompatibleResponsesRewritesAssistantOutputTextHistory(t *testing
 	part := content[0].(map[string]any)
 	if part["type"] != "input_text" || part["text"] != "first response" {
 		t.Fatalf("assistant history content = %#v", content)
+	}
+}
+
+func TestPrepareCompatibleResponsesMovesContinuationInstructionsIntoInput(t *testing.T) {
+	wire, compat, err := PrepareCompatibleResponsesWithCache(map[string]any{
+		"model": "grok-4.5", "previous_response_id": "resp_parent",
+		"instructions": "Reply only with CURRENT_OK.", "input": "continue",
+	}, NewToolReplayCache(0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := wire["instructions"]; exists {
+		t.Fatalf("instructions were forwarded with previous id: %#v", wire)
+	}
+	if wire["previous_response_id"] != "resp_parent" {
+		t.Fatalf("previous id = %#v", wire["previous_response_id"])
+	}
+	input := wire["input"].([]any)
+	if len(input) != 2 || String(input[0].(map[string]any), "role", "") != "developer" || String(input[1].(map[string]any), "role", "") != "user" {
+		t.Fatalf("input = %#v", input)
+	}
+	normalized := compat.NormalizeResponse(map[string]any{"id": "resp_child", "output": []any{}}, "grok-4.5")
+	if normalized["instructions"] != "Reply only with CURRENT_OK." {
+		t.Fatalf("normalized instructions = %#v", normalized["instructions"])
 	}
 }
 
@@ -448,17 +462,24 @@ func translate(t *testing.T, compat *ResponsesCompatibility, event string, paylo
 
 func TestTranslateStreamDropsNativeEventsAndFiltersNestedResponse(t *testing.T) {
 	compat := &ResponsesCompatibility{
-		aliases: map[string]toolIdentity{}, originalAliases: map[string]string{}, streamCalls: map[string]*streamToolCall{},
+		aliases: map[string]toolIdentity{}, originalAliases: map[string]string{}, streamCalls: map[string]*streamToolCall{}, publicModel: "grok-4.5",
 	}
 	if events := translate(t, compat, "grok.custom", map[string]any{"type": "grok.custom", "value": true}); len(events) != 0 {
 		t.Fatalf("native event leaked: %#v", events)
 	}
 	completed := translateOne(t, compat, "response.completed", map[string]any{
 		"type":     "response.completed",
-		"response": map[string]any{"id": "resp_1", "object": "response", "status": "completed", "output": []any{}, "grok_field": true},
+		"response": map[string]any{"id": "resp_1", "object": "response", "status": "completed", "model": "grok-4.5-build-free", "output": []any{}, "billing": map[string]any{"x": 1}, "usage": map[string]any{"input_tokens": 2, "cost_in_usd_ticks": 3}, "grok_field": true},
 	})
 	response := completed["response"].(map[string]any)
 	if _, ok := response["grok_field"]; ok {
 		t.Fatalf("native response field leaked: %#v", response)
+	}
+	if response["model"] != "grok-4.5" || response["billing"] != nil {
+		t.Fatalf("nested response was not normalized: %#v", response)
+	}
+	usage := response["usage"].(map[string]any)
+	if len(usage) != 1 || usage["input_tokens"] != float64(2) {
+		t.Fatalf("nested usage = %#v", usage)
 	}
 }

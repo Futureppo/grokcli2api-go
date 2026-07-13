@@ -78,6 +78,10 @@ flowchart LR
 
 `POST /v1/responses` 默认按 OpenAI Responses API 处理：请求字段会按 Grok CLI 0.2.99 的 Responses 类型清洗，非流式响应与 SSE 事件会移除 Grok 原生扩展。只有请求包含明确的 Grok CLI 标识时才启用原生透传，包括 `X-XAI-Token-Auth: xai-grok-cli`、`x-grok-client-version`、已知的 Grok 客户端名称/标识，或 `grok-cli/`、`grok-shell/`、`grok-pager/` 等 User-Agent。任意或未知的 `x-grok-client-*` 值不会触发原生格式。
 
+兼容分支未指定 `store` 时按 OpenAI 默认值使用 `store: true`。后续请求可通过 `previous_response_id` 续接，并会固定回到生成该 Response 的上游账号；同一 Response ID 可派生多个独立分支。该账号亲和与工具回放状态仅保存在当前服务进程内，重启后不会恢复。显式 `store: false` 时，普通 previous ID 会由上游返回 not-found；函数工具调用可在缓存仍有效时使用最小调用结构本地续接，服务不会额外缓存用户文本或图片。
+
+兼容范围包括文本、多轮、Function/custom/namespace/tool-search、并行工具结果、Web Search、HTTPS 或 Base64 data URI 图片、`text.format.json_schema` 以及 typed SSE。错误请求返回 `400 invalid_request_error` 和准确的 `param` 路径，请求体超过 16 MiB 返回 `413`。当前不提供 `/v1/conversations`、`/v1/files`、音频、后台任务轮询、图片生成输出，以及 Web Search 之外的托管工具执行；相关参数会返回明确的 `unsupported_parameter`，不会静默忽略。
+
 `POST /v1/messages` 仍以 Anthropic 格式对外，并通过上游 Responses API 执行。Anthropic `metadata.user_id` 会映射为 Responses 的 `safety_identifier`；`stop_sequences` 由兼容层在非流式与流式响应中执行。文本、图片、图片型工具结果、并行函数工具及 Web Search server-tool 结果均会转换为对应的 Anthropic 内容块；只有请求显式启用 `thinking` 时才返回 thinking/signature 块。格式错误或断裂的 `tool_use` / `tool_result` 关系会在本地返回 Anthropic `400 invalid_request_error`。
 
 ## 快速开始
@@ -230,6 +234,47 @@ curl http://localhost:8088/v1/responses \
   }'
 ```
 
+默认的多轮续接只需保存上一轮 ID：
+
+```bash
+FIRST_ID=$(curl -s http://localhost:8088/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-kfcvivo50" \
+  -d '{"model":"grok-4.5","input":"Remember that my code is 7319."}' | jq -r .id)
+
+curl http://localhost:8088/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-kfcvivo50" \
+  -d "{\"model\":\"grok-4.5\",\"previous_response_id\":\"$FIRST_ID\",\"input\":\"What is my code?\"}"
+```
+
+图片可使用 HTTPS URL 或 Base64 data URI，并保持文本与多图的原始顺序：
+
+```json
+{
+  "model": "grok-4.5",
+  "input": [{
+    "type": "message",
+    "role": "user",
+    "content": [
+      {"type": "input_text", "text": "Describe this image."},
+      {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "high"}
+    ]
+  }]
+}
+```
+
+Function 工具结果使用首轮返回的 `call_id`，并将首轮 Response ID 放入 `previous_response_id`：
+
+```json
+{
+  "model": "grok-4.5",
+  "previous_response_id": "resp_...",
+  "input": [{"type": "function_call_output", "call_id": "call_...", "output": "sunny, 26 C"}],
+  "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+}
+```
+
 ### Anthropic Messages
 
 ```bash
@@ -258,8 +303,8 @@ X-Grok-Session-ID: conversation-123
 
 服务也会依次识别以下字段作为亲和标识：
 
-- OpenAI `prompt_cache_key`
 - OpenAI `previous_response_id`
+- OpenAI `prompt_cache_key`
 - OpenAI `user`
 - Anthropic `metadata.user_id`
 
@@ -351,6 +396,13 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
 | `GROK_TLS_INSECURE_SKIP_VERIFY` | `false` | 跳过上游 TLS 验证，仅限受控调试环境 |
 
 未设置 `GROK_PROXY_URL` 时，程序遵循标准的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY` 环境变量。
+
+例如通过本机 HTTP 代理 `7890` 访问上游：
+
+```dotenv
+GROK_PROXY_URL=http://127.0.0.1:7890
+GROK_NO_PROXY=localhost,127.0.0.1
+```
 
 命令行参数 `-host` 和 `-port` 可覆盖对应环境变量，`-version` 用于输出当前版本：
 

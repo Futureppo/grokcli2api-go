@@ -78,6 +78,10 @@ Malformed content or broken message/tool-call relationships return an OpenAI-sha
 
 `POST /v1/responses` uses the OpenAI Responses API format by default. Request fields are sanitized against the Grok CLI 0.2.99 Responses types, while Grok-native extensions are removed from non-streaming responses and SSE events. Native passthrough is enabled only for an explicit Grok CLI identity: `X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version`, a recognized Grok client name/identifier, or a `grok-cli/`, `grok-shell/`, or `grok-pager/` User-Agent. Arbitrary or unknown `x-grok-client-*` values do not select the native format.
 
+When `store` is omitted, the compatibility branch follows the OpenAI default and sends `store: true`. Later requests can continue with `previous_response_id` and are pinned to the upstream account that created the Response; one Response ID may be used for multiple independent branches. Account affinity and tool-replay state are in-memory and do not survive a service restart. With explicit `store: false`, an ordinary previous ID produces the upstream not-found error. Function-tool continuations can still use a cached minimal call shape while the cache entry is alive; user text and images are not additionally cached.
+
+The supported surface includes text, multi-turn state, Function/custom/namespace/tool-search tools, parallel tool results, Web Search, HTTPS or Base64 data URI images, `text.format.json_schema`, and typed SSE. Invalid requests return `400 invalid_request_error` with an exact `param` path; bodies over 16 MiB return `413`. The proxy does not currently provide `/v1/conversations`, `/v1/files`, audio, background-task polling, image-generation output, or managed tool execution other than Web Search. Those parameters return an explicit `unsupported_parameter` instead of being silently dropped.
+
 `POST /v1/messages` remains Anthropic-shaped externally and executes through the upstream Responses API. Anthropic `metadata.user_id` maps to the Responses `safety_identifier`; `stop_sequences`, which the Responses request cannot represent, is not forwarded and produces a compatibility warning.
 
 ## Quick Start
@@ -230,6 +234,47 @@ curl http://localhost:8088/v1/responses \
   }'
 ```
 
+For a default stateful conversation, retain only the previous response ID:
+
+```bash
+FIRST_ID=$(curl -s http://localhost:8088/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-kfcvivo50" \
+  -d '{"model":"grok-4.5","input":"Remember that my code is 7319."}' | jq -r .id)
+
+curl http://localhost:8088/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-kfcvivo50" \
+  -d "{\"model\":\"grok-4.5\",\"previous_response_id\":\"$FIRST_ID\",\"input\":\"What is my code?\"}"
+```
+
+Images can use an HTTPS URL or a Base64 data URI while preserving mixed text/image order:
+
+```json
+{
+  "model": "grok-4.5",
+  "input": [{
+    "type": "message",
+    "role": "user",
+    "content": [
+      {"type": "input_text", "text": "Describe this image."},
+      {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "high"}
+    ]
+  }]
+}
+```
+
+For a Function result, use the `call_id` returned by the first turn and pass that turn's Response ID as `previous_response_id`:
+
+```json
+{
+  "model": "grok-4.5",
+  "previous_response_id": "resp_...",
+  "input": [{"type": "function_call_output", "call_id": "call_...", "output": "sunny, 26 C"}],
+  "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+}
+```
+
 ### Anthropic Messages
 
 ```bash
@@ -258,8 +303,8 @@ X-Grok-Session-ID: conversation-123
 
 The service also recognizes the following fields as affinity identifiers, in order:
 
-- OpenAI `prompt_cache_key`
 - OpenAI `previous_response_id`
+- OpenAI `prompt_cache_key`
 - OpenAI `user`
 - Anthropic `metadata.user_id`
 
@@ -351,6 +396,13 @@ Free-model quota cooldowns are isolated by account and model. An exhausted spend
 | `GROK_TLS_INSECURE_SKIP_VERIFY` | `false` | Disable upstream TLS verification; controlled debugging only |
 
 When `GROK_PROXY_URL` is unset, the service honors the standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` environment variables.
+
+For example, to use a local HTTP proxy on port `7890`:
+
+```dotenv
+GROK_PROXY_URL=http://127.0.0.1:7890
+GROK_NO_PROXY=localhost,127.0.0.1
+```
 
 The `-host` and `-port` command-line flags override the corresponding environment variables. Use `-version` to print the current version:
 

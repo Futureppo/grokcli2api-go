@@ -321,7 +321,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	native := isGrokCLIClient(r)
 	if err := openai.ValidateResponsesRequest(body, native); err != nil {
 		timing.MarkPrepare(time.Since(prepareStarted))
-		writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "422")
+		writeResponsesRequestError(w, err)
 		return
 	}
 	var compat *openai.ResponsesCompatibility
@@ -333,7 +333,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		wire, compat, err = openai.PrepareCompatibleResponses(body)
 		if err != nil {
 			timing.MarkPrepare(time.Since(prepareStarted))
-			writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "422")
+			writeResponsesRequestError(w, err)
 			return
 		}
 	}
@@ -342,6 +342,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	affinity := requestAffinity(r, body)
 	convID := conversationID(affinity)
 	promptCacheKey := openai.String(body, "prompt_cache_key", "")
+	store, _ := wire["store"].(bool)
 	if !openai.IsStreaming(body) {
 		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 		if err != nil {
@@ -354,12 +355,12 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 			normalized := compat.NormalizeResponse(payload, model)
 			// Index tool calls so Alma can continue with previous_response_id
 			// / item_reference without re-sending the matching function_call.
-			openai.RememberCompletedResponse(openai.DefaultToolReplay, model, normalized, promptCacheKey)
+			openai.RememberCompletedResponseWithStore(openai.DefaultToolReplay, model, normalized, promptCacheKey, store)
 			writeJSON(w, http.StatusOK, normalized)
 		}
 		return
 	}
-	s.streamResponses(w, r, wire, affinity, convID, model, native, compat, promptCacheKey)
+	s.streamResponses(w, r, wire, affinity, convID, model, native, compat, promptCacheKey, store)
 }
 
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
@@ -444,7 +445,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[str
 	flush()
 }
 
-func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string, native bool, compat *openai.ResponsesCompatibility, promptCacheKey string) {
+func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string, native bool, compat *openai.ResponsesCompatibility, promptCacheKey string, store bool) {
 	stream, err := s.client.OpenStream(r.Context(), "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 	if err != nil {
 		s.writeClientError(w, err)
@@ -458,7 +459,8 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 	// Accumulate tool calls from output_item.done, then index under
 	// prev-resp:{response.id} when response.completed arrives (done events
 	// often omit response_id, so early prev-resp writes can miss).
-	replay := &streamToolReplayState{model: model, promptCacheKey: promptCacheKey}
+	replay := &streamToolReplayState{model: model, promptCacheKey: promptCacheKey, store: store}
+	terminal := false
 	for {
 		event, ok, nextErr := stream.Next()
 		if nextErr != nil {
@@ -470,6 +472,11 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 			return
 		}
 		if !ok {
+			if !native && !terminal {
+				payload, _ := json.Marshal(openai.ResponseStreamError("upstream stream ended before a terminal event", "upstream_stream_incomplete"))
+				_ = writeRawSSE(w, grok.SSEEvent{Event: "error", Data: payload})
+				flush()
+			}
 			return
 		}
 		if string(event.Data) == "[DONE]" && !native {
@@ -497,6 +504,10 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 					}
 				}
 				replay.handle(translatedEvent.Event, translatedEvent.Data)
+				switch translatedEvent.Event {
+				case "response.completed", "response.failed", "response.incomplete", "error":
+					terminal = true
+				}
 				if err := writeRawSSE(w, translatedEvent); err != nil {
 					return
 				}
@@ -520,6 +531,7 @@ type streamToolReplayState struct {
 	model          string
 	promptCacheKey string
 	responseID     string
+	store          bool
 	// items holds function/custom tool calls from output_item.done, ordered.
 	items []map[string]any
 }
@@ -558,7 +570,7 @@ func (s *streamToolReplayState) handle(event string, data []byte) {
 			// Do NOT write prev-resp here: done events often omit response_id
 			// and the session key is only committed on completed.
 			if id := openai.String(item, "id", ""); id != "" {
-				openai.RememberStreamToolCall(openai.DefaultToolReplay, s.model, item, "", "")
+				openai.RememberStreamToolCallWithStore(openai.DefaultToolReplay, s.model, item, "", "", s.store)
 			}
 		}
 	case "response.completed":
@@ -582,7 +594,7 @@ func (s *streamToolReplayState) handle(event string, data []byte) {
 				response["output"] = patched
 			}
 		}
-		openai.RememberCompletedResponse(openai.DefaultToolReplay, s.model, response, s.promptCacheKey)
+		openai.RememberCompletedResponseWithStore(openai.DefaultToolReplay, s.model, response, s.promptCacheKey, s.store)
 	}
 }
 
@@ -719,6 +731,15 @@ func (s *Server) writeClientError(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusBadGateway, err.Error(), "upstream_error", "502")
 }
 
+func writeResponsesRequestError(w http.ResponseWriter, err error) {
+	var requestErr *openai.RequestError
+	if errors.As(err, &requestErr) {
+		writeErrorWithParam(w, http.StatusBadRequest, requestErr.Message, "invalid_request_error", requestErr.Code, requestErr.Param)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_value")
+}
+
 func (s *Server) writeAnthropicClientError(w http.ResponseWriter, err error) {
 	var modelUnavailable *auth.ModelUnavailableError
 	if errors.As(err, &modelUnavailable) {
@@ -792,7 +813,11 @@ func upstreamError(e *grok.APIError) map[string]any {
 	if message == "" {
 		message = e.Error()
 	}
-	inner := map[string]any{"message": message, "type": kind, "code": code, "param": nil}
+	var param any
+	if e.UpstreamParam != "" {
+		param = e.UpstreamParam
+	}
+	inner := map[string]any{"message": message, "type": kind, "code": code, "param": param}
 	if code == "personal-team-blocked:spending-limit" {
 		inner["hint"] = "your Grok account hit the spending limit. Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok."
 	}
@@ -804,11 +829,26 @@ func decodeRequest(w http.ResponseWriter, r *http.Request) (map[string]any, bool
 	var body map[string]any
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20))
 	if err := dec.Decode(&body); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds 16 MiB", "invalid_request_error", "request_too_large")
+			return nil, false
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), "invalid_request_error", "400")
 		return nil, false
 	}
 	if body == nil {
 		writeError(w, http.StatusBadRequest, "JSON object required", "invalid_request_error", "400")
+		return nil, false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds 16 MiB", "invalid_request_error", "request_too_large")
+		} else {
+			writeError(w, http.StatusBadRequest, "request body must contain exactly one JSON object", "invalid_request_error", "invalid_json")
+		}
 		return nil, false
 	}
 	return body, true
@@ -831,6 +871,10 @@ func decodeAnthropicRequest(w http.ResponseWriter, r *http.Request) (map[string]
 
 func writeError(w http.ResponseWriter, status int, message, kind, code string) {
 	writeJSON(w, status, openai.Error(message, kind, code))
+}
+
+func writeErrorWithParam(w http.ResponseWriter, status int, message, kind, code, param string) {
+	writeJSON(w, status, openai.ErrorWithParam(message, kind, code, param))
 }
 
 func writeUnavailable(w http.ResponseWriter, unavailable *auth.UnavailableError, anthropicResponse bool) {
@@ -1008,14 +1052,14 @@ func isGrokCLIClient(r *http.Request) bool {
 }
 
 func requestAffinity(r *http.Request, body map[string]any) auth.Affinity {
+	if value := openai.String(body, "previous_response_id", ""); value != "" {
+		return auth.Affinity{Key: "previous:" + value, Mode: auth.AffinityHard}
+	}
 	if value := strings.TrimSpace(r.Header.Get("X-Grok-Session-ID")); value != "" {
 		return auth.Affinity{Key: "session:" + value, Mode: auth.AffinityHard}
 	}
 	if value := openai.String(body, "prompt_cache_key", ""); value != "" {
 		return auth.Affinity{Key: "cache:" + value, Mode: auth.AffinitySoft}
-	}
-	if value := openai.String(body, "previous_response_id", ""); value != "" {
-		return auth.Affinity{Key: "previous:" + value, Mode: auth.AffinityHard}
 	}
 	if value := openai.String(body, "user", ""); value != "" {
 		return auth.Affinity{Key: "user:" + value, Mode: auth.AffinitySoft}

@@ -1,8 +1,12 @@
 package openai
 
 import (
+	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestToolReplayRestoresCallsFromPreviousResponseID(t *testing.T) {
@@ -45,6 +49,139 @@ func TestToolReplayRestoresCallsFromPreviousResponseID(t *testing.T) {
 	if output["type"] != "function_call_output" || output["call_id"] != "call_1" {
 		t.Fatalf("tool output = %#v", output)
 	}
+}
+
+func TestStoredToolContinuationForwardsPreviousResponseWithoutReplay(t *testing.T) {
+	cache := NewToolReplayCache(0, 0)
+	RememberCompletedResponseWithStore(cache, "grok-4.5", map[string]any{
+		"id": "resp_stored", "output": []any{map[string]any{
+			"id": "fc_1", "type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": `{}`,
+		}},
+	}, "", true)
+	wire, compat, err := PrepareCompatibleResponsesWithCache(map[string]any{
+		"model": "grok-4.5", "previous_response_id": "resp_stored",
+		"input": []any{map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "ok"}},
+	}, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire["previous_response_id"] != "resp_stored" {
+		t.Fatalf("previous_response_id = %#v", wire["previous_response_id"])
+	}
+	input := wire["input"].([]any)
+	if len(input) != 1 || String(input[0].(map[string]any), "type", "") != "function_call_output" {
+		t.Fatalf("stored continuation was replayed: %#v", input)
+	}
+	normalized := compat.NormalizeResponse(map[string]any{"id": "resp_2", "output": []any{}}, "grok-4.5")
+	if _, exists := normalized["previous_response_id"]; exists {
+		t.Fatalf("stored continuation synthesized previous id: %#v", normalized)
+	}
+}
+
+func TestUnknownPreviousResponseIDIsForwarded(t *testing.T) {
+	wire, _, err := PrepareCompatibleResponsesWithCache(map[string]any{
+		"model": "grok-4.5", "previous_response_id": "resp_unknown", "input": "continue",
+	}, NewToolReplayCache(0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire["previous_response_id"] != "resp_unknown" {
+		t.Fatalf("wire = %#v", wire)
+	}
+}
+
+func TestStatelessToolReplayRestoresPreviousResponseField(t *testing.T) {
+	cache := NewToolReplayCache(0, 0)
+	RememberCompletedResponseWithStore(cache, "grok-4.5", map[string]any{
+		"id": "resp_stateless", "output": []any{map[string]any{
+			"id": "fc_1", "type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": `{}`,
+		}},
+	}, "", false)
+	wire, compat, err := PrepareCompatibleResponsesWithCache(map[string]any{
+		"model": "grok-4.5", "previous_response_id": "resp_stateless",
+		"input": []any{map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "ok"}},
+	}, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := wire["previous_response_id"]; exists {
+		t.Fatalf("stateless replay forwarded previous id: %#v", wire)
+	}
+	normalized := compat.NormalizeResponse(map[string]any{"id": "resp_2", "output": []any{}}, "grok-4.5")
+	if normalized["previous_response_id"] != "resp_stateless" {
+		t.Fatalf("normalized previous id = %#v", normalized["previous_response_id"])
+	}
+}
+
+func TestStatelessParallelToolReplayAcceptsOutOfOrderOutputs(t *testing.T) {
+	cache := NewToolReplayCache(0, 0)
+	RememberCompletedResponseWithStore(cache, "grok-4.5", map[string]any{
+		"id": "resp_parallel", "output": []any{
+			map[string]any{"id": "fc_1", "type": "function_call", "call_id": "call_1", "name": "one", "arguments": `{}`},
+			map[string]any{"id": "fc_2", "type": "function_call", "call_id": "call_2", "name": "two", "arguments": `{}`},
+		},
+	}, "", false)
+	wire, _, err := PrepareCompatibleResponsesWithCache(map[string]any{
+		"model": "grok-4.5", "previous_response_id": "resp_parallel", "parallel_tool_calls": true,
+		"input": []any{
+			map[string]any{"type": "function_call_output", "call_id": "call_2", "output": "second"},
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "first"},
+		},
+	}, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := wire["previous_response_id"]; exists {
+		t.Fatalf("previous id leaked after complete replay: %#v", wire)
+	}
+	input := wire["input"].([]any)
+	if len(input) != 4 || String(input[0].(map[string]any), "call_id", "") != "call_1" || String(input[1].(map[string]any), "call_id", "") != "call_2" {
+		t.Fatalf("parallel replay = %#v", input)
+	}
+}
+
+func TestIncompleteStatelessToolReplayPreservesPreviousResponseID(t *testing.T) {
+	cache := NewToolReplayCache(0, 0)
+	RememberCompletedResponseWithStore(cache, "grok-4.5", map[string]any{
+		"id": "resp_incomplete", "output": []any{
+			map[string]any{"id": "fc_1", "type": "function_call", "call_id": "call_1", "name": "one", "arguments": `{}`},
+		},
+	}, "", false)
+	wire, _, err := PrepareCompatibleResponsesWithCache(map[string]any{
+		"model": "grok-4.5", "previous_response_id": "resp_incomplete",
+		"input": []any{
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "one"},
+			map[string]any{"type": "function_call_output", "call_id": "call_missing", "output": "missing"},
+		},
+	}, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire["previous_response_id"] != "resp_incomplete" {
+		t.Fatalf("incomplete replay lost previous id: %#v", wire)
+	}
+	input := wire["input"].([]any)
+	if len(input) != 2 {
+		t.Fatalf("incomplete replay partially mutated input: %#v", input)
+	}
+}
+
+func TestToolReplayCacheConcurrentAccess(t *testing.T) {
+	cache := NewToolReplayCache(time.Minute, 64)
+	item := []map[string]any{{"id": "fc", "type": "function_call", "call_id": "call", "name": "lookup", "arguments": `{}`}}
+	var wg sync.WaitGroup
+	for index := 0; index < 16; index++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			key := fmt.Sprintf("prev-resp:resp_%d", index%4)
+			for iteration := 0; iteration < 100; iteration++ {
+				cache.put("grok-4.5", key, item, iteration%2 == 0, true)
+				_, _ = cache.getRecord("grok-4.5", key)
+			}
+		}(index)
+	}
+	wg.Wait()
 }
 
 func TestToolReplayExpandsItemReference(t *testing.T) {
@@ -143,9 +280,9 @@ func TestNormalizeReplayItemsPreservesNamespace(t *testing.T) {
 	}
 }
 
-func TestToolReplayPrunesOrphanOutputs(t *testing.T) {
+func TestToolReplayRejectsOrphanOutputs(t *testing.T) {
 	cache := NewToolReplayCache(0, 0)
-	wire, _, err := PrepareCompatibleResponsesWithCache(map[string]any{
+	_, _, err := PrepareCompatibleResponsesWithCache(map[string]any{
 		"model": "grok-4.5",
 		"input": []any{
 			map[string]any{"type": "item_reference", "id": "missing"},
@@ -153,26 +290,9 @@ func TestToolReplayPrunesOrphanOutputs(t *testing.T) {
 			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "hi"}}},
 		},
 	}, cache)
-	if err != nil {
-		t.Fatal(err)
-	}
-	input := wire["input"].([]any)
-	if len(input) != 1 || String(input[0].(map[string]any), "type", "") != "message" {
-		t.Fatalf("expected only message after orphan prune, got %#v", input)
-	}
-}
-
-func TestPruneOrphanToolOutputsKeepsSliceWhenUnchanged(t *testing.T) {
-	input := []any{
-		map[string]any{"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": `{}`},
-		map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "ok"},
-		map[string]any{"type": "message", "role": "user", "content": "continue"},
-	}
-	body := map[string]any{"input": input}
-	pruneOrphanToolOutputs(body)
-	got := body["input"].([]any)
-	if &got[0] != &input[0] {
-		t.Fatal("unchanged input was copied")
+	var requestErr *RequestError
+	if !errors.As(err, &requestErr) || requestErr.Param != "input[0].call_id" {
+		t.Fatalf("error = %#v", err)
 	}
 }
 
