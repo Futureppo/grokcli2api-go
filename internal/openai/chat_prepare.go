@@ -467,11 +467,49 @@ func (p *chatPreparer) prepareMessageContent(raw any, path string, allowImages b
 			}
 			out = append(out, map[string]any{"type": "image_url", "image_url": image})
 			p.recordUnknownObjectFields(part, map[string]bool{"type": true, "image_url": true}, partPath)
+		case "image":
+			if !allowImages {
+				return nil, fmt.Errorf("%s.type image is only valid for user messages", partPath)
+			}
+			image, err := p.prepareAnthropicImage(part, partPath)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, map[string]any{"type": "image_url", "image_url": image})
+			p.recordUnknownObjectFields(part, map[string]bool{"type": true, "source": true}, partPath)
 		default:
 			return nil, fmt.Errorf("%s.type %q is not supported", partPath, kind)
 		}
 	}
 	return out, nil
+}
+
+func (p *chatPreparer) prepareAnthropicImage(block map[string]any, path string) (map[string]any, error) {
+	source, ok := block["source"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s.source must be an object", path)
+	}
+	var url string
+	switch sourceType, _ := source["type"].(string); sourceType {
+	case "url":
+		value, ok := source["url"].(string)
+		if !ok || strings.TrimSpace(value) == "" {
+			return nil, fmt.Errorf("%s.source.url must be a non-empty string", path)
+		}
+		url = value
+	case "base64":
+		mediaType, _ := source["media_type"].(string)
+		data, _ := source["data"].(string)
+		if strings.TrimSpace(mediaType) == "" || strings.TrimSpace(data) == "" {
+			return nil, fmt.Errorf("%s.source media_type and data are required for base64 images", path)
+		}
+		url = "data:" + mediaType + ";base64," + data
+	default:
+		return nil, fmt.Errorf("%s.source.type %q is not supported", path, sourceType)
+	}
+	p.recordUnknownObjectFields(source, map[string]bool{"type": true, "url": true, "media_type": true, "data": true}, path+".source")
+	p.change(path, "rewritten", "Anthropic image block is normalized to OpenAI image_url content")
+	return map[string]any{"url": url}, nil
 }
 
 func (p *chatPreparer) prepareImageURL(raw any, path string) (map[string]any, error) {

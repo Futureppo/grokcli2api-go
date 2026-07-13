@@ -66,6 +66,7 @@ func TestPrepareChatNormalizesMessagesAndToolHistory(t *testing.T) {
 			map[string]any{"role": "user", "content": []any{
 				map[string]any{"type": "text", "text": "inspect", "cache_control": true},
 				map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AA", "detail": "low", "vendor": true}},
+				map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "BB", "vendor": true}, "cache_control": true},
 			}},
 			map[string]any{"role": "assistant", "content": nil, "reasoning_content": "need tool", "tool_calls": []any{
 				map[string]any{"id": "call-1", "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{"id":1}`, "extra": true}},
@@ -82,11 +83,15 @@ func TestPrepareChatNormalizesMessagesAndToolHistory(t *testing.T) {
 	if parts[0].(map[string]any)["cache_control"] != nil || parts[1].(map[string]any)["image_url"].(map[string]any)["vendor"] != nil {
 		t.Fatalf("content metadata leaked: %#v", parts)
 	}
+	convertedImage := parts[2].(map[string]any)
+	if convertedImage["type"] != "image_url" || convertedImage["image_url"].(map[string]any)["url"] != "data:image/png;base64,BB" {
+		t.Fatalf("Anthropic image block was not normalized: %#v", convertedImage)
+	}
 	call := messages[2].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
 	if call["function"].(map[string]any)["extra"] != nil {
 		t.Fatalf("tool call metadata leaked: %#v", call)
 	}
-	for _, path := range []string{"messages[0].role", "messages[0].cache_control", "messages[1].content[0].cache_control", "messages[2].tool_calls[0].function.extra"} {
+	for _, path := range []string{"messages[0].role", "messages[0].cache_control", "messages[1].content[0].cache_control", "messages[1].content[2]", "messages[2].tool_calls[0].function.extra"} {
 		if !hasChatChange(prepared.Changes, path) {
 			t.Fatalf("missing change for %s", path)
 		}
