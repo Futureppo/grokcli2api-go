@@ -149,6 +149,23 @@ func TestPrepareCompatibleResponsesRewritesAssistantOutputTextHistory(t *testing
 	}
 }
 
+func TestPrepareCompatibleResponsesDoesNotAddMissingMessageContent(t *testing.T) {
+	wire, _, err := PrepareCompatibleResponses(map[string]any{
+		"model": "grok-4.5",
+		"input": []any{
+			map[string]any{"type": "message", "role": "assistant", "tool_calls": []any{map[string]any{"id": "call_1", "type": "function"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := wire["input"].([]any)
+	message := input[0].(map[string]any)
+	if _, exists := message["content"]; exists {
+		t.Fatalf("missing content was added: %#v", message)
+	}
+}
+
 func TestPrepareCompatibleResponsesNormalizesCodexHostedTools(t *testing.T) {
 	wire, _, err := PrepareCompatibleResponses(map[string]any{
 		"model": "grok-4.5", "input": "hello",

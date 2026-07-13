@@ -202,8 +202,8 @@ func sanitizeInputItem(item map[string]any) map[string]any {
 	out := clone(item)
 	delete(out, "internal_chat_message_metadata_passthrough")
 	delete(out, "phase")
-	if String(out, "type", "") == "message" {
-		out["content"] = sanitizeMessageContent(out["content"])
+	if content, exists := out["content"]; exists && String(out, "type", "") == "message" {
+		out["content"] = sanitizeMessageContent(content)
 	}
 	return out
 }
