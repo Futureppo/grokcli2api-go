@@ -1037,6 +1037,58 @@ func TestAnthropicMessagesStreamingSequence(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesAppliesResponseOptions(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		stream := stream
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n")
+					_, _ = io.WriteString(w, "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"reasoning_1\",\"type\":\"reasoning\"}}\n\n")
+					_, _ = io.WriteString(w, "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"reasoning_1\",\"delta\":\"hidden\"}\n\n")
+					_, _ = io.WriteString(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"reasoning_1\",\"type\":\"reasoning\"}}\n\n")
+					_, _ = io.WriteString(w, "event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_1\",\"content_index\":0,\"part\":{\"type\":\"output_text\"}}\n\n")
+					_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"ABCST\"}\n\n")
+					_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"OPXYZ\"}\n\n")
+					_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n")
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{
+					"id": "resp_1", "output": []any{
+						map[string]any{"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "hidden"}}},
+						map[string]any{"type": "message", "content": []any{map[string]any{"type": "output_text", "text": "ABCSTOPXYZ"}}},
+					},
+				})
+			}))
+			defer upstream.Close()
+			h := newTestHandler(t, upstream.URL, nil)
+			body := fmt.Sprintf(`{"model":"grok-4","max_tokens":128,"stream":%t,"stop_sequences":["STOP"],"messages":[{"role":"user","content":"hi"}]}`, stream)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+			text := rec.Body.String()
+			if rec.Code != http.StatusOK || strings.Contains(text, "hidden") || strings.Contains(text, "XYZ") || !strings.Contains(text, "ABC") || !strings.Contains(text, "stop_sequence") || !strings.Contains(text, "STOP") {
+				t.Fatalf("status=%d body=%s", rec.Code, text)
+			}
+			if !strings.Contains(text, "msg_resp_1") {
+				t.Fatalf("message id was not normalized: %s", text)
+			}
+		})
+	}
+}
+
+func TestAnthropicMessagesRejectsOrphanToolResult(t *testing.T) {
+	h := newTestHandler(t, "http://127.0.0.1:1", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"grok-4","max_tokens":64,
+		"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_missing","content":"x"}]}]
+	}`)))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"type":"error"`) || !strings.Contains(rec.Body.String(), "does not match a pending tool_use") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAnthropicAuthErrorEnvelope(t *testing.T) {
 	h := newTestHandler(t, "http://127.0.0.1:1", []string{"key"})
 	rec := httptest.NewRecorder()

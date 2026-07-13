@@ -16,6 +16,14 @@ const DefaultVersion = "2023-06-01"
 type Prepared struct {
 	Body     map[string]any
 	Warnings []string
+	Options  ResponseOptions
+}
+
+// ResponseOptions carries Anthropic-only response semantics that the Grok
+// Responses endpoint cannot apply itself.
+type ResponseOptions struct {
+	ThinkingEnabled bool
+	StopSequences   []string
 }
 
 func Validate(body map[string]any) error {
@@ -44,6 +52,18 @@ func Validate(body map[string]any) error {
 			number, ok := number(value)
 			if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || number > 1 {
 				return fmt.Errorf("%s must be a number between 0 and 1", key)
+			}
+		}
+	}
+	if value, exists := body["stop_sequences"]; exists {
+		sequences, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("stop_sequences must be an array of strings")
+		}
+		for index, raw := range sequences {
+			sequence, ok := raw.(string)
+			if !ok || sequence == "" {
+				return fmt.Errorf("stop_sequences[%d] must be a non-empty string", index)
 			}
 		}
 	}
@@ -126,9 +146,6 @@ func Prepare(body map[string]any) (Prepared, error) {
 		return Prepared{}, err
 	}
 	warnings := []string{}
-	if _, ok := body["stop_sequences"]; ok {
-		warnings = append(warnings, "stop_sequences")
-	}
 	for _, key := range []string{"service_tier", "context_management", "container"} {
 		if _, ok := body[key]; ok {
 			warnings = append(warnings, key)
@@ -146,29 +163,46 @@ func Prepare(body map[string]any) (Prepared, error) {
 			warnings = append(warnings, key)
 		}
 	}
-	return Prepared{Body: out, Warnings: warnings}, nil
+	options := ResponseOptions{ThinkingEnabled: thinkingEnabled(body)}
+	if raw, ok := body["stop_sequences"].([]any); ok {
+		options.StopSequences = make([]string, 0, len(raw))
+		for _, value := range raw {
+			options.StopSequences = append(options.StopSequences, value.(string))
+		}
+	}
+	return Prepared{Body: out, Warnings: warnings, Options: options}, nil
 }
 
 func convertMessages(messages []any) ([]any, error) {
 	var out []any
-	for _, raw := range messages {
+	pendingCalls := map[string]struct{}{}
+	usedCalls := map[string]struct{}{}
+	for messageIndex, raw := range messages {
 		message, ok := raw.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("messages entries must be objects")
+			return nil, fmt.Errorf("messages[%d] must be an object", messageIndex)
 		}
 		role := stringValue(message["role"])
 		if role != "user" && role != "assistant" {
-			return nil, fmt.Errorf("unsupported Anthropic message role %q", role)
+			return nil, fmt.Errorf("messages[%d].role %q is not supported", messageIndex, role)
+		}
+		if len(pendingCalls) > 0 && role != "user" {
+			return nil, fmt.Errorf("messages[%d] must be a user message containing tool_result blocks", messageIndex)
 		}
 		content := message["content"]
 		if text, ok := content.(string); ok {
+			if len(pendingCalls) > 0 {
+				return nil, fmt.Errorf("messages[%d].content must return every pending tool_use", messageIndex)
+			}
 			out = append(out, map[string]any{"type": "message", "role": role, "content": text})
 			continue
 		}
 		blocks, ok := content.([]any)
 		if !ok {
-			return nil, fmt.Errorf("message content must be a string or array")
+			return nil, fmt.Errorf("messages[%d].content must be a string or array", messageIndex)
 		}
+		hadPending := len(pendingCalls) > 0
+		sawRegularBeforeResult := false
 		var regular []any
 		flush := func() {
 			if len(regular) > 0 {
@@ -176,37 +210,82 @@ func convertMessages(messages []any) ([]any, error) {
 				regular = nil
 			}
 		}
-		for _, rawBlock := range blocks {
+		for blockIndex, rawBlock := range blocks {
+			path := fmt.Sprintf("messages[%d].content[%d]", messageIndex, blockIndex)
 			block, ok := rawBlock.(map[string]any)
 			if !ok {
-				return nil, fmt.Errorf("content blocks must be objects")
+				return nil, fmt.Errorf("%s must be an object", path)
 			}
 			switch stringValue(block["type"]) {
 			case "text":
+				sawRegularBeforeResult = len(pendingCalls) > 0
 				regular = append(regular, map[string]any{"type": "input_text", "text": stringValue(block["text"])})
 			case "image":
+				sawRegularBeforeResult = len(pendingCalls) > 0
 				image, err := convertImage(block)
 				if err != nil {
 					return nil, err
 				}
 				regular = append(regular, image)
 			case "document":
+				sawRegularBeforeResult = len(pendingCalls) > 0
 				file, err := convertDocument(block)
 				if err != nil {
 					return nil, err
 				}
 				regular = append(regular, file)
 			case "tool_use":
+				if role != "assistant" {
+					return nil, fmt.Errorf("%s tool_use is only valid in assistant messages", path)
+				}
+				id := strings.TrimSpace(stringValue(block["id"]))
+				name := strings.TrimSpace(stringValue(block["name"]))
+				input, inputOK := block["input"].(map[string]any)
+				if id == "" || name == "" || !inputOK {
+					return nil, fmt.Errorf("%s tool_use requires id, name, and object input", path)
+				}
+				if _, duplicate := usedCalls[id]; duplicate {
+					return nil, fmt.Errorf("%s contains duplicate tool_use id %q", path, id)
+				}
 				flush()
-				arguments, err := json.Marshal(block["input"])
+				arguments, err := json.Marshal(input)
 				if err != nil {
 					return nil, err
 				}
-				out = append(out, map[string]any{"type": "function_call", "call_id": block["id"], "name": block["name"], "arguments": string(arguments)})
+				out = append(out, map[string]any{"type": "function_call", "call_id": id, "name": name, "arguments": string(arguments)})
+				pendingCalls[id] = struct{}{}
+				usedCalls[id] = struct{}{}
 			case "tool_result":
+				if role != "user" {
+					return nil, fmt.Errorf("%s tool_result is only valid in user messages", path)
+				}
+				id := strings.TrimSpace(stringValue(block["tool_use_id"]))
+				if _, exists := pendingCalls[id]; id == "" || !exists {
+					return nil, fmt.Errorf("%s.tool_use_id %q does not match a pending tool_use", path, id)
+				}
+				if sawRegularBeforeResult {
+					return nil, fmt.Errorf("%s tool_result blocks must precede text and media blocks", path)
+				}
+				output, err := convertToolResultContent(block["content"], path+".content")
+				if err != nil {
+					return nil, err
+				}
+				if isError, exists := block["is_error"]; exists {
+					value, ok := isError.(bool)
+					if !ok {
+						return nil, fmt.Errorf("%s.is_error must be a boolean", path)
+					}
+					if value {
+						output = markToolError(output)
+					}
+				}
 				flush()
-				out = append(out, map[string]any{"type": "function_call_output", "call_id": block["tool_use_id"], "output": toolOutput(block["content"])})
+				out = append(out, map[string]any{"type": "function_call_output", "call_id": id, "output": output})
+				delete(pendingCalls, id)
 			case "thinking":
+				if role != "assistant" {
+					return nil, fmt.Errorf("%s thinking is only valid in assistant messages", path)
+				}
 				flush()
 				item := map[string]any{"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": stringValue(block["thinking"])}}}
 				if signature := stringValue(block["signature"]); signature != "" {
@@ -214,6 +293,9 @@ func convertMessages(messages []any) ([]any, error) {
 				}
 				out = append(out, item)
 			case "redacted_thinking":
+				if role != "assistant" {
+					return nil, fmt.Errorf("%s redacted_thinking is only valid in assistant messages", path)
+				}
 				flush()
 				out = append(out, map[string]any{"type": "reasoning", "encrypted_content": block["data"]})
 			default:
@@ -221,8 +303,62 @@ func convertMessages(messages []any) ([]any, error) {
 			}
 		}
 		flush()
+		if hadPending && len(pendingCalls) > 0 {
+			return nil, fmt.Errorf("messages[%d].content must return every pending tool_use", messageIndex)
+		}
+	}
+	if len(pendingCalls) > 0 {
+		return nil, fmt.Errorf("messages must include tool_result blocks for every tool_use")
 	}
 	return out, nil
+}
+
+func convertToolResultContent(value any, path string) (any, error) {
+	if text, ok := value.(string); ok {
+		return text, nil
+	}
+	blocks, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be a string or content block array", path)
+	}
+	out := make([]any, 0, len(blocks))
+	for index, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%s[%d] must be an object", path, index)
+		}
+		switch stringValue(block["type"]) {
+		case "text":
+			out = append(out, map[string]any{"type": "input_text", "text": stringValue(block["text"])})
+		case "image":
+			image, err := convertImage(block)
+			if err != nil {
+				return nil, fmt.Errorf("%s[%d]: %w", path, index, err)
+			}
+			out = append(out, image)
+		case "document":
+			document, err := convertDocument(block)
+			if err != nil {
+				return nil, fmt.Errorf("%s[%d]: %w", path, index, err)
+			}
+			out = append(out, document)
+		default:
+			return nil, fmt.Errorf("%s[%d].type %q is not supported", path, index, stringValue(block["type"]))
+		}
+	}
+	if len(out) == 0 {
+		return "", nil
+	}
+	return out, nil
+}
+
+func markToolError(output any) any {
+	const prefix = "Tool execution failed: "
+	if text, ok := output.(string); ok {
+		return prefix + text
+	}
+	blocks, _ := output.([]any)
+	return append([]any{map[string]any{"type": "input_text", "text": prefix}}, blocks...)
 }
 
 func convertSystem(value any) (any, error) {
@@ -410,10 +546,14 @@ func limitDomains(value any, limit int) any {
 }
 
 func NormalizeResponse(raw map[string]any, fallbackModel string) map[string]any {
-	content := responseContent(raw)
+	return NormalizeResponseWithOptions(raw, fallbackModel, ResponseOptions{})
+}
+
+func NormalizeResponseWithOptions(raw map[string]any, fallbackModel string, options ResponseOptions) map[string]any {
+	content := responseContent(raw, options)
 	stopReason := "end_turn"
 	for _, rawBlock := range content {
-		if block, ok := rawBlock.(map[string]any); ok && (block["type"] == "tool_use" || block["type"] == "server_tool_use") {
+		if block, ok := rawBlock.(map[string]any); ok && block["type"] == "tool_use" {
 			stopReason = "tool_use"
 			break
 		}
@@ -424,20 +564,25 @@ func NormalizeResponse(raw map[string]any, fallbackModel string) map[string]any 
 	if sequence := stringValue(raw["stop_sequence"]); sequence != "" {
 		stopReason = "stop_sequence"
 	}
-	id := stringValue(raw["id"])
-	if id == "" {
-		id = "msg_" + grok.NewID()
+	stopSequence := any(raw["stop_sequence"])
+	if trimmed, matched := applyStopSequences(content, options.StopSequences); matched != "" {
+		content = trimmed
+		stopReason = "stop_sequence"
+		stopSequence = matched
 	}
+	id := anthropicID("msg_", stringValue(raw["id"]))
 	return map[string]any{
 		"id": id, "type": "message", "role": "assistant", "model": fallbackModel,
-		"content": content, "stop_reason": stopReason, "stop_sequence": raw["stop_sequence"],
+		"content": content, "stop_reason": stopReason, "stop_sequence": stopSequence,
 		"usage": normalizeUsage(raw["usage"]),
 	}
 }
 
-func responseContent(raw map[string]any) []any {
+func responseContent(raw map[string]any, options ResponseOptions) []any {
 	var content []any
 	if output, ok := raw["output"].([]any); ok {
+		titles := citationTitles(output)
+		seenWebSearch := map[string]bool{}
 		for _, rawItem := range output {
 			item, ok := rawItem.(map[string]any)
 			if !ok {
@@ -451,7 +596,7 @@ func responseContent(raw map[string]any) []any {
 						switch stringValue(part["type"]) {
 						case "output_text", "text":
 							block := map[string]any{"type": "text", "text": stringValue(part["text"])}
-							if citations, ok := part["citations"]; ok {
+							if citations := anthropicCitations(part, stringValue(part["text"])); len(citations) > 0 {
 								block["citations"] = citations
 							}
 							content = append(content, block)
@@ -461,6 +606,9 @@ func responseContent(raw map[string]any) []any {
 					}
 				}
 			case "reasoning":
+				if !options.ThinkingEnabled {
+					continue
+				}
 				text := reasoningText(item)
 				if text != "" || item["encrypted_content"] != nil {
 					block := map[string]any{"type": "thinking", "thinking": text}
@@ -471,9 +619,20 @@ func responseContent(raw map[string]any) []any {
 				}
 			case "function_call", "custom_tool_call":
 				content = append(content, toolUseBlock(item))
-			case "web_search_call", "file_search_call", "code_interpreter_call", "computer_call", "mcp_call",
+			case "web_search_call":
+				rawID := rawItemID(item)
+				if seenWebSearch[rawID] {
+					continue
+				}
+				seenWebSearch[rawID] = true
+				id := anthropicID("srvtoolu_", rawID)
+				content = append(content,
+					map[string]any{"type": "server_tool_use", "id": id, "name": "web_search", "input": webSearchInput(item)},
+					map[string]any{"type": "web_search_tool_result", "tool_use_id": id, "content": webSearchResults(output, rawID, titles)},
+				)
+			case "file_search_call", "code_interpreter_call", "computer_call", "mcp_call",
 				"image_generation_call", "local_shell_call", "shell_call", "apply_patch_call", "mcp_list_tools":
-				content = append(content, map[string]any{"type": "server_tool_use", "id": itemID(item), "name": item["type"], "input": item["action"]})
+				content = append(content, map[string]any{"type": "server_tool_use", "id": anthropicID("srvtoolu_", rawItemID(item)), "name": item["type"], "input": item["action"]})
 			}
 		}
 	}
@@ -498,6 +657,157 @@ func responseContent(raw map[string]any) []any {
 	return content
 }
 
+func applyStopSequences(content []any, sequences []string) ([]any, string) {
+	if len(sequences) == 0 {
+		return content, ""
+	}
+	var visible strings.Builder
+	for _, raw := range content {
+		if block, ok := raw.(map[string]any); ok && block["type"] == "text" {
+			visible.WriteString(stringValue(block["text"]))
+		}
+	}
+	text := visible.String()
+	stopAt := -1
+	matched := ""
+	for _, sequence := range sequences {
+		if index := strings.Index(text, sequence); index >= 0 && (stopAt < 0 || index < stopAt) {
+			stopAt = index
+			matched = sequence
+		}
+	}
+	if stopAt < 0 {
+		return content, ""
+	}
+	trimmed := make([]any, 0, len(content))
+	visibleAt := 0
+	for _, raw := range content {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			if visibleAt < stopAt {
+				trimmed = append(trimmed, raw)
+			}
+			continue
+		}
+		if block["type"] != "text" {
+			if visibleAt < stopAt {
+				trimmed = append(trimmed, raw)
+			}
+			continue
+		}
+		value := stringValue(block["text"])
+		if visibleAt >= stopAt {
+			break
+		}
+		keep := stopAt - visibleAt
+		if keep >= len(value) {
+			trimmed = append(trimmed, raw)
+			visibleAt += len(value)
+			continue
+		}
+		copy := cloneMap(block)
+		copy["text"] = value[:keep]
+		trimmed = append(trimmed, copy)
+		break
+	}
+	return trimmed, matched
+}
+
+func citationTitles(output []any) map[string]string {
+	titles := map[string]string{}
+	for _, rawItem := range output {
+		item, _ := rawItem.(map[string]any)
+		parts, _ := item["content"].([]any)
+		for _, rawPart := range parts {
+			part, _ := rawPart.(map[string]any)
+			annotations, _ := part["annotations"].([]any)
+			for _, rawAnnotation := range annotations {
+				annotation, _ := rawAnnotation.(map[string]any)
+				if url := stringValue(annotation["url"]); url != "" {
+					titles[url] = stringValue(annotation["title"])
+				}
+			}
+		}
+	}
+	return titles
+}
+
+func anthropicCitations(part map[string]any, text string) []any {
+	raw, _ := part["annotations"].([]any)
+	if len(raw) == 0 {
+		raw, _ = part["citations"].([]any)
+	}
+	out := make([]any, 0, len(raw))
+	for _, value := range raw {
+		annotation, _ := value.(map[string]any)
+		if citation := anthropicCitation(annotation, text); citation != nil {
+			out = append(out, citation)
+		}
+	}
+	return out
+}
+
+func anthropicCitation(annotation map[string]any, text string) map[string]any {
+	if annotation == nil {
+		return nil
+	}
+	if stringValue(annotation["type"]) != "url_citation" && stringValue(annotation["url"]) == "" {
+		return cloneMap(annotation)
+	}
+	citation := map[string]any{
+		"type":  "web_search_result_location",
+		"url":   annotation["url"],
+		"title": annotation["title"],
+	}
+	start, startOK := number(annotation["start_index"])
+	end, endOK := number(annotation["end_index"])
+	if startOK && endOK && start >= 0 && end >= start && int(end) <= len(text) {
+		citation["cited_text"] = text[int(start):int(end)]
+	}
+	return citation
+}
+
+func webSearchInput(item map[string]any) map[string]any {
+	action, _ := item["action"].(map[string]any)
+	input := map[string]any{}
+	for _, key := range []string{"query", "type"} {
+		if value, exists := action[key]; exists {
+			input[key] = value
+		}
+	}
+	return input
+}
+
+func webSearchResults(output []any, rawID string, titles map[string]string) []any {
+	seen := map[string]bool{}
+	var results []any
+	for _, rawItem := range output {
+		item, _ := rawItem.(map[string]any)
+		if stringValue(item["type"]) != "web_search_call" || rawItemID(item) != rawID {
+			continue
+		}
+		action, _ := item["action"].(map[string]any)
+		sources, _ := action["sources"].([]any)
+		for _, rawSource := range sources {
+			source, _ := rawSource.(map[string]any)
+			url := stringValue(source["url"])
+			if url == "" || seen[url] {
+				continue
+			}
+			seen[url] = true
+			title := titles[url]
+			if title == "" {
+				title = url
+			}
+			results = append(results, map[string]any{"type": "web_search_result", "url": url, "title": title})
+		}
+	}
+	if results == nil {
+		return []any{}
+	}
+	return results
+}
+
 func toolUseBlock(item map[string]any) map[string]any {
 	input := any(map[string]any{})
 	if args := stringValue(item["arguments"]); args != "" {
@@ -507,7 +817,7 @@ func toolUseBlock(item map[string]any) map[string]any {
 	} else if value, ok := item["input"]; ok {
 		input = value
 	}
-	return map[string]any{"type": "tool_use", "id": itemID(item), "name": item["name"], "input": input}
+	return map[string]any{"type": "tool_use", "id": anthropicID("toolu_", rawItemID(item)), "name": item["name"], "input": input}
 }
 
 func reasoningText(item map[string]any) string {
@@ -545,21 +855,36 @@ func Error(message, kind string) map[string]any {
 	return map[string]any{"type": "error", "error": map[string]any{"type": kind, "message": message}}
 }
 
-func itemID(item map[string]any) string {
+func rawItemID(item map[string]any) string {
 	for _, key := range []string{"call_id", "id"} {
 		if value := stringValue(item[key]); value != "" {
 			return value
 		}
 	}
-	return "toolu_" + grok.NewID()
+	return ""
 }
 
-func toolOutput(value any) string {
-	if text, ok := value.(string); ok {
-		return text
+func anthropicID(prefix, raw string) string {
+	if strings.HasPrefix(raw, prefix) {
+		return raw
 	}
-	b, _ := json.Marshal(value)
-	return string(b)
+	if raw == "" {
+		raw = grok.NewID()
+	}
+	return prefix + raw
+}
+
+func thinkingEnabled(body map[string]any) bool {
+	thinking, _ := body["thinking"].(map[string]any)
+	return stringValue(thinking["type"]) == "enabled"
+}
+
+func cloneMap(value map[string]any) map[string]any {
+	out := make(map[string]any, len(value))
+	for key, item := range value {
+		out[key] = item
+	}
+	return out
 }
 
 func boolValue(value any) bool     { result, _ := value.(bool); return result }

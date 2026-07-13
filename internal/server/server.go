@@ -392,10 +392,10 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 			s.writeAnthropicClientError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, anthropic.NormalizeResponse(payload, model))
+		writeJSON(w, http.StatusOK, anthropic.NormalizeResponseWithOptions(payload, model, prepared.Options))
 		return
 	}
-	s.streamAnthropic(w, r, prepared.Body, affinity, convID, model)
+	s.streamAnthropic(w, r, prepared.Body, affinity, convID, model, prepared.Options)
 }
 
 func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string) {
@@ -504,7 +504,7 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 	}
 }
 
-func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string) {
+func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string, options anthropic.ResponseOptions) {
 	stream, err := s.client.OpenStream(r.Context(), "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 	if err != nil {
 		s.writeAnthropicClientError(w, err)
@@ -515,7 +515,7 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, wire ma
 	flush := flusher(w)
 	timing := grok.RequestTimingFromContext(r.Context())
 	timing.MarkDownstreamFlush(false)
-	translator := anthropic.NewStreamTranslator(model)
+	translator := anthropic.NewStreamTranslatorWithOptions(model, options)
 	for {
 		event, ok, nextErr := stream.Next()
 		if nextErr != nil {

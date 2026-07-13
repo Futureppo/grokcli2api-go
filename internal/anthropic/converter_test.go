@@ -113,7 +113,7 @@ func TestPreparePreservesAnthropicWebSearchTool(t *testing.T) {
 	}
 }
 
-func TestPrepareDropsUnsupportedStopAndCapsDomains(t *testing.T) {
+func TestPrepareHandlesStopLocallyAndCapsDomains(t *testing.T) {
 	prepared, err := Prepare(map[string]any{
 		"model": "grok-4", "max_tokens": float64(128),
 		"messages":       []any{map[string]any{"role": "user", "content": "search"}},
@@ -129,8 +129,8 @@ func TestPrepareDropsUnsupportedStopAndCapsDomains(t *testing.T) {
 	if _, ok := prepared.Body["stop"]; ok {
 		t.Fatalf("stop leaked upstream: %#v", prepared.Body)
 	}
-	if !slices.Contains(prepared.Warnings, "stop_sequences") {
-		t.Fatalf("warnings = %#v", prepared.Warnings)
+	if !slices.Equal(prepared.Options.StopSequences, []string{"done"}) {
+		t.Fatalf("stop sequences = %#v", prepared.Options.StopSequences)
 	}
 	tool := prepared.Body["tools"].([]any)[0].(map[string]any)
 	if domains := tool["allowed_domains"].([]any); len(domains) != 5 {
@@ -216,12 +216,12 @@ func TestNormalizeResponseMapsReasoningTextToolAndUsage(t *testing.T) {
 		},
 		"usage": map[string]any{"input_tokens": float64(10), "output_tokens": float64(5)},
 	}
-	out := NormalizeResponse(raw, "grok-4")
+	out := NormalizeResponseWithOptions(raw, "grok-4", ResponseOptions{ThinkingEnabled: true})
 	if out["type"] != "message" || out["stop_reason"] != "tool_use" {
 		t.Fatalf("out=%#v", out)
 	}
 	blocks := out["content"].([]any)
-	if len(blocks) != 3 || blocks[0].(map[string]any)["type"] != "thinking" || blocks[2].(map[string]any)["type"] != "tool_use" {
+	if len(blocks) != 3 || blocks[0].(map[string]any)["type"] != "thinking" || blocks[2].(map[string]any)["type"] != "tool_use" || blocks[2].(map[string]any)["id"] != "toolu_call_1" {
 		t.Fatalf("blocks=%#v", blocks)
 	}
 }
@@ -257,7 +257,7 @@ func TestStreamTranslatorProducesAnthropicSequence(t *testing.T) {
 }
 
 func TestStreamTranslatorEmitsThinkingSignature(t *testing.T) {
-	translator := NewStreamTranslator("grok-4")
+	translator := NewStreamTranslatorWithOptions("grok-4", ResponseOptions{ThinkingEnabled: true})
 	inputs := []grok.SSEEvent{
 		jsonEvent("response.output_item.added", map[string]any{
 			"type": "response.output_item.added", "output_index": float64(0),
@@ -285,6 +285,194 @@ func TestStreamTranslatorEmitsThinkingSignature(t *testing.T) {
 	}
 	if len(deltas) != 2 || deltas[0]["type"] != "thinking_delta" || deltas[1]["type"] != "signature_delta" || deltas[1]["signature"] != "signature-1" {
 		t.Fatalf("deltas = %#v", deltas)
+	}
+}
+
+func TestPreparePreservesMultimodalToolResult(t *testing.T) {
+	prepared, err := Prepare(map[string]any{
+		"model": "grok-4", "max_tokens": float64(128),
+		"messages": []any{
+			map[string]any{"role": "assistant", "content": []any{map[string]any{
+				"type": "tool_use", "id": "toolu_1", "name": "capture", "input": map[string]any{},
+			}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{
+				"type": "tool_result", "tool_use_id": "toolu_1", "content": []any{
+					map[string]any{"type": "text", "text": "screenshot"},
+					map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+				},
+			}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := prepared.Body["input"].([]any)
+	output := input[1].(map[string]any)["output"].([]any)
+	if len(output) != 2 || output[0].(map[string]any)["type"] != "input_text" || output[1].(map[string]any)["type"] != "input_image" {
+		t.Fatalf("tool output = %#v", output)
+	}
+}
+
+func TestPrepareValidatesToolCallRelationships(t *testing.T) {
+	base := func(messages []any) map[string]any {
+		return map[string]any{"model": "grok-4", "max_tokens": float64(64), "messages": messages}
+	}
+	tests := []struct {
+		name     string
+		messages []any
+		want     string
+	}{
+		{
+			name: "orphan result",
+			messages: []any{map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "toolu_missing", "content": "x"},
+			}}},
+			want: "does not match a pending tool_use",
+		},
+		{
+			name: "missing result",
+			messages: []any{map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": map[string]any{}},
+			}}},
+			want: "must include tool_result",
+		},
+		{
+			name: "result after text",
+			messages: []any{
+				map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": map[string]any{}}}},
+				map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "late"}, map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "content": "x"}}},
+			},
+			want: "must precede text and media",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Prepare(base(test.messages))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeResponseFiltersUnrequestedThinkingAndNormalizesID(t *testing.T) {
+	out := NormalizeResponse(map[string]any{
+		"id": "response-1",
+		"output": []any{
+			map[string]any{"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "hidden"}}},
+			map[string]any{"type": "message", "content": []any{map[string]any{"type": "output_text", "text": "answer"}}},
+		},
+	}, "grok-4")
+	blocks := out["content"].([]any)
+	if out["id"] != "msg_response-1" || len(blocks) != 1 || blocks[0].(map[string]any)["type"] != "text" {
+		t.Fatalf("out = %#v", out)
+	}
+}
+
+func TestNormalizeResponseAppliesStopAcrossTextBlocks(t *testing.T) {
+	out := NormalizeResponseWithOptions(map[string]any{
+		"id": "response-1",
+		"output": []any{map[string]any{"type": "message", "content": []any{
+			map[string]any{"type": "output_text", "text": "ABCST"},
+			map[string]any{"type": "output_text", "text": "OPXYZ"},
+		}}},
+	}, "grok-4", ResponseOptions{StopSequences: []string{"STOP"}})
+	blocks := out["content"].([]any)
+	if out["stop_reason"] != "stop_sequence" || out["stop_sequence"] != "STOP" || len(blocks) != 1 || blocks[0].(map[string]any)["text"] != "ABC" {
+		t.Fatalf("out = %#v", out)
+	}
+}
+
+func TestNormalizeResponseMapsWebSearchServerTool(t *testing.T) {
+	raw := map[string]any{
+		"id": "response-1",
+		"output": []any{
+			map[string]any{"type": "web_search_call", "id": "ws_1", "action": map[string]any{"type": "search", "query": "go", "sources": []any{map[string]any{"type": "url", "url": "https://go.dev"}}}},
+			map[string]any{"type": "web_search_call", "id": "ws_1", "action": map[string]any{"type": "search", "query": "go", "sources": []any{map[string]any{"type": "url", "url": "https://go.dev"}}}},
+			map[string]any{"type": "message", "content": []any{map[string]any{
+				"type": "output_text", "text": "Go",
+				"annotations": []any{map[string]any{"type": "url_citation", "url": "https://go.dev", "title": "The Go Programming Language", "start_index": float64(0), "end_index": float64(2)}},
+			}}},
+		},
+	}
+	out := NormalizeResponse(raw, "grok-4")
+	blocks := out["content"].([]any)
+	if out["stop_reason"] != "end_turn" || len(blocks) != 3 {
+		t.Fatalf("out = %#v", out)
+	}
+	use := blocks[0].(map[string]any)
+	result := blocks[1].(map[string]any)
+	text := blocks[2].(map[string]any)
+	if use["type"] != "server_tool_use" || use["name"] != "web_search" || use["id"] != "srvtoolu_ws_1" {
+		t.Fatalf("server tool = %#v", use)
+	}
+	results := result["content"].([]any)
+	if result["type"] != "web_search_tool_result" || result["tool_use_id"] != use["id"] || len(results) != 1 || results[0].(map[string]any)["title"] != "The Go Programming Language" {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(text["citations"].([]any)) != 1 {
+		t.Fatalf("text = %#v", text)
+	}
+}
+
+func TestStreamTranslatorAppliesStopAcrossDeltas(t *testing.T) {
+	translator := NewStreamTranslatorWithOptions("grok-4", ResponseOptions{StopSequences: []string{"STOP"}})
+	inputs := []grok.SSEEvent{
+		jsonEvent("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": "response-1"}}),
+		jsonEvent("response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": "message-1", "content_index": float64(0), "part": map[string]any{"type": "output_text"}}),
+		jsonEvent("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": "message-1", "content_index": float64(0), "delta": "ABCST"}),
+		jsonEvent("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": "message-1", "content_index": float64(0), "delta": "OPXYZ"}),
+		jsonEvent("response.completed", map[string]any{"type": "response.completed", "response": map[string]any{}}),
+	}
+	var text string
+	var delta map[string]any
+	for _, input := range inputs {
+		events, err := translator.Handle(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event.Name == "content_block_delta" {
+				part := event.Data["delta"].(map[string]any)
+				text += stringValue(part["text"])
+			}
+			if event.Name == "message_delta" {
+				delta = event.Data["delta"].(map[string]any)
+			}
+		}
+	}
+	if text != "ABC" || delta["stop_reason"] != "stop_sequence" || delta["stop_sequence"] != "STOP" {
+		t.Fatalf("text=%q delta=%#v", text, delta)
+	}
+}
+
+func TestStreamTranslatorMapsWebSearchResult(t *testing.T) {
+	translator := NewStreamTranslator("grok-4")
+	added := map[string]any{"id": "ws_1", "type": "web_search_call", "action": map[string]any{"type": "search", "query": "go", "sources": []any{}}}
+	done := map[string]any{"id": "ws_1", "type": "web_search_call", "action": map[string]any{"type": "search", "query": "go", "sources": []any{map[string]any{"type": "url", "url": "https://go.dev"}}}}
+	inputs := []grok.SSEEvent{
+		jsonEvent("response.output_item.added", map[string]any{"type": "response.output_item.added", "item": added}),
+		jsonEvent("response.output_item.done", map[string]any{"type": "response.output_item.done", "item": done}),
+		jsonEvent("response.completed", map[string]any{"type": "response.completed", "response": map[string]any{}}),
+	}
+	var starts []map[string]any
+	var stopReason any
+	for _, input := range inputs {
+		events, err := translator.Handle(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event.Name == "content_block_start" {
+				starts = append(starts, event.Data["content_block"].(map[string]any))
+			}
+			if event.Name == "message_delta" {
+				stopReason = event.Data["delta"].(map[string]any)["stop_reason"]
+			}
+		}
+	}
+	if len(starts) != 2 || starts[0]["type"] != "server_tool_use" || starts[0]["name"] != "web_search" || starts[1]["type"] != "web_search_tool_result" || stopReason != "end_turn" {
+		t.Fatalf("starts=%#v stop=%#v", starts, stopReason)
 	}
 }
 
