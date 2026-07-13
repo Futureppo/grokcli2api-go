@@ -68,6 +68,12 @@ The service is optimized for different subscription tiers, and each request is r
 
 The compatibility layer preserves commonly used request fields, response structures, and streaming events where possible, but it does not guarantee support for every parameter or behavior of the official APIs. When integrating through an API aggregation project such as New API, enable **passthrough** for all request parameters.
 
+### Chat Completions request sanitization
+
+Before forwarding `POST /v1/chat/completions`, the service rebuilds the body using the Grok CLI upstream request shape. It supports messages, text/image content, function tools, structured output, search parameters, and reasoning effort. Common aliases are mapped to their upstream forms, including `max_completion_tokens` → `max_tokens`, `functions` → `tools`, `function_call` → `tool_choice`, and `user` → `user_id`. Undeclared top-level fields and nested client metadata are removed; sanitized paths are recorded only at `DEBUG` level and field values are never logged.
+
+Malformed content or broken message/tool-call relationships return an OpenAI-shaped local `422 invalid_request_error`. The `grok-4.5*` and `composer` model families also drop unsupported sampling penalties and stop parameters.
+
 ## Quick Start
 
 ### One-command deployment (Linux)

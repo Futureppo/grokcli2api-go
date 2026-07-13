@@ -4,7 +4,7 @@ import "testing"
 
 func TestPrepareChatPreservesExtensions(t *testing.T) {
 	body := map[string]any{"model": "grok-4", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "reasoning_effort": "low"}
-	out := PrepareChat(body)
+	out := mustPrepareChat(t, body).Body
 	if out["reasoning_effort"] != "low" {
 		t.Fatal("extension field lost")
 	}
@@ -18,7 +18,7 @@ func TestPrepareChatStripsUnsupportedGrok45PresencePenalty(t *testing.T) {
 		"model": "grok-4.5", "messages": []any{map[string]any{"role": "user", "content": "hi"}},
 		"presence_penalty": float64(0.5), "presencePenalty": float64(0.5),
 	}
-	out := PrepareChat(body)
+	out := mustPrepareChat(t, body).Body
 	if _, ok := out["presence_penalty"]; ok {
 		t.Fatal("presence_penalty was forwarded to grok-4.5")
 	}
@@ -29,16 +29,20 @@ func TestPrepareChatStripsUnsupportedGrok45PresencePenalty(t *testing.T) {
 		t.Fatal("PrepareChat mutated the caller's request")
 	}
 
-	other := PrepareChat(map[string]any{"model": "grok-4", "presence_penalty": float64(0.5)})
+	other := mustPrepareChat(t, map[string]any{
+		"model": "grok-4", "messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"presence_penalty": float64(0.5),
+	}).Body
 	if other["presence_penalty"] != float64(0.5) {
 		t.Fatal("presence_penalty should remain available to other models")
 	}
 }
 
 func TestPrepareChatStripsUnsupportedComposerPresencePenalty(t *testing.T) {
-	out := PrepareChat(map[string]any{
-		"model": "composer", "presence_penalty": float64(0.5), "presencePenalty": float64(0.5),
-	})
+	out := mustPrepareChat(t, map[string]any{
+		"model": "composer", "messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"presence_penalty": float64(0.5), "presencePenalty": float64(0.5),
+	}).Body
 	if _, ok := out["presence_penalty"]; ok {
 		t.Fatal("presence_penalty was forwarded to composer")
 	}
@@ -48,11 +52,11 @@ func TestPrepareChatStripsUnsupportedComposerPresencePenalty(t *testing.T) {
 }
 
 func TestPrepareChatNormalizesStrictComposerParameters(t *testing.T) {
-	out := PrepareChat(map[string]any{
-		"model": "grok-composer-2.5-fast", "stop": []any{"done"},
+	out := mustPrepareChat(t, map[string]any{
+		"model": "grok-composer-2.5-fast", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "stop": []any{"done"},
 		"frequency_penalty": float64(0.2), "frequencyPenalty": float64(0.2),
 		"reasoning_effort": "adaptive",
-	})
+	}).Body
 	for _, key := range []string{"stop", "frequency_penalty", "frequencyPenalty"} {
 		if _, ok := out[key]; ok {
 			t.Fatalf("%s was forwarded: %#v", key, out)
@@ -180,4 +184,13 @@ func TestErrorHasSingleEnvelope(t *testing.T) {
 	if len(err) != 1 || err["error"] == nil {
 		t.Fatalf("unexpected error: %#v", err)
 	}
+}
+
+func mustPrepareChat(t *testing.T, body map[string]any) PreparedChat {
+	t.Helper()
+	prepared, err := PrepareChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return prepared
 }

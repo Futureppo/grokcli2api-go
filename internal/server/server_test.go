@@ -91,6 +91,87 @@ func TestAPIKeyGateAndChatProxy(t *testing.T) {
 	}
 }
 
+func TestChatProxySanitizesStreamingAndNonStreamingBodies(t *testing.T) {
+	var mu sync.Mutex
+	var received []map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			return
+		}
+		mu.Lock()
+		received = append(received, body)
+		mu.Unlock()
+		if streaming, _ := body["stream"].(bool); streaming {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}}}})
+	}))
+	defer upstream.Close()
+	h := newTestHandler(t, upstream.URL, nil)
+
+	for _, stream := range []bool{false, true} {
+		body := fmt.Sprintf(`{
+			"model":"grok-4",
+			"messages":[{"role":"developer","content":"rules","cache_control":true},{"role":"user","content":"hi"}],
+			"stream":%t,
+			"max_completion_tokens":128,
+			"parallel_tool_calls":true,
+			"stream_options":{"include_usage":true},
+			"unknown_extension":"drop-me"
+		}`, stream)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "ok") {
+			t.Fatalf("stream=%t status=%d body=%s", stream, rec.Code, rec.Body.String())
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 2 {
+		t.Fatalf("upstream requests = %d, want 2", len(received))
+	}
+	for index, body := range received {
+		if body["max_tokens"] != float64(128) {
+			t.Fatalf("request[%d] max_tokens = %#v", index, body["max_tokens"])
+		}
+		for _, key := range []string{"max_completion_tokens", "parallel_tool_calls", "stream_options", "unknown_extension"} {
+			if _, exists := body[key]; exists {
+				t.Fatalf("request[%d] leaked %s: %#v", index, key, body)
+			}
+		}
+		messages := body["messages"].([]any)
+		first := messages[0].(map[string]any)
+		if first["role"] != "system" || first["cache_control"] != nil {
+			t.Fatalf("request[%d] messages = %#v", index, messages)
+		}
+	}
+}
+
+func TestChatProxyReturnsLocal422BeforeMalformedToolHistoryReachesUpstream(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		writeJSON(w, http.StatusOK, map[string]any{})
+	}))
+	defer upstream.Close()
+	h := newTestHandler(t, upstream.URL, nil)
+
+	rec := httptest.NewRecorder()
+	body := `{"model":"grok-4","messages":[{"role":"tool","tool_call_id":"missing","content":"result"}]}`
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), "does not reference an earlier assistant tool call") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("malformed request reached upstream %d times", calls.Load())
+	}
+}
+
 func TestQuotaErrorSwitchesAccount(t *testing.T) {
 	var mu sync.Mutex
 	var tokens []string

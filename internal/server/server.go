@@ -281,12 +281,16 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prepareStarted := time.Now()
-	if err := openai.ValidateChatRequest(body); err != nil {
+	prepared, err := openai.PrepareChat(body)
+	if err != nil {
 		timing.MarkPrepare(time.Since(prepareStarted))
 		writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "422")
 		return
 	}
-	wire := openai.PrepareChat(body)
+	for _, change := range prepared.Changes {
+		slog.Debug("chat compatibility field sanitized", "path", change.Path, "action", change.Action, "reason", change.Reason)
+	}
+	wire := prepared.Body
 	timing.MarkPrepare(time.Since(prepareStarted))
 	model := openai.String(body, "model", "")
 	affinity := requestAffinity(r, body)

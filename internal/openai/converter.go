@@ -65,23 +65,6 @@ func String(body map[string]any, key, fallback string) string {
 	return fallback
 }
 
-func PrepareChat(body map[string]any) map[string]any {
-	out := clone(body)
-	out["stream"] = IsStreaming(body)
-	if IsStrictCompatibilityModel(String(body, "model", "")) {
-		// These models reject the OpenAI sampling penalty, while older
-		// upstream models may still accept it. Handle both spellings so
-		// OpenAI-compatible and direct clients behave consistently.
-		delete(out, "presence_penalty")
-		delete(out, "presencePenalty")
-		delete(out, "frequency_penalty")
-		delete(out, "frequencyPenalty")
-		delete(out, "stop")
-	}
-	normalizeReasoning(out, false)
-	return out
-}
-
 // PrepareResponses accepts the current OpenAI Responses request shape while
 // retaining compatibility with the old chat-shaped implementation.
 func PrepareResponses(body map[string]any) map[string]any {

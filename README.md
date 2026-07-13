@@ -68,6 +68,12 @@ flowchart LR
 
 兼容层会尽可能保留常用的请求字段、响应结构和流式事件，但不保证覆盖官方 API 的全部参数与行为。接入 New API 等 API 聚合项目时，请开启所有请求参数的**透传**。
 
+### Chat Completions 请求清洗
+
+`POST /v1/chat/completions` 会在转发前按 Grok CLI 上游结构重建请求体。支持消息、多模态文本/图片、函数工具、结构化输出、搜索参数及推理强度；常见别名会转换为上游字段，包括 `max_completion_tokens` → `max_tokens`、`functions` → `tools`、`function_call` → `tool_choice`、`user` → `user_id`。上游未声明的顶层字段和嵌套元数据会被移除，清洗路径仅在 `DEBUG` 日志中记录且不包含字段值。
+
+格式错误或会破坏消息、工具调用关系的内容会在本地返回 OpenAI 格式的 `422 invalid_request_error`。`grok-4.5*` 与 `composer` 模型族还会移除其不支持的采样惩罚和停止参数。
+
 ## 快速开始
 
 ### 一键部署（Linux）
