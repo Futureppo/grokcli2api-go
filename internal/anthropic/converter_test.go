@@ -415,6 +415,22 @@ func TestNormalizeResponseMapsWebSearchServerTool(t *testing.T) {
 	}
 }
 
+func TestNormalizeResponseMapsWebOpenPageResult(t *testing.T) {
+	out := NormalizeResponse(map[string]any{
+		"output": []any{
+			map[string]any{"type": "web_search_call", "id": "ws_1", "action": map[string]any{"type": "open_page", "url": "https://go.dev/"}},
+			map[string]any{"type": "message", "content": []any{map[string]any{
+				"type": "output_text", "text": "Go", "annotations": []any{map[string]any{"type": "url_citation", "url": "https://go.dev/", "title": "Go"}},
+			}}},
+		},
+	}, "grok-4")
+	blocks := out["content"].([]any)
+	result := blocks[1].(map[string]any)["content"].([]any)
+	if len(result) != 1 || result[0].(map[string]any)["url"] != "https://go.dev/" || result[0].(map[string]any)["title"] != "Go" {
+		t.Fatalf("blocks = %#v", blocks)
+	}
+}
+
 func TestStreamTranslatorAppliesStopAcrossDeltas(t *testing.T) {
 	translator := NewStreamTranslatorWithOptions("grok-4", ResponseOptions{StopSequences: []string{"STOP"}})
 	inputs := []grok.SSEEvent{

@@ -770,7 +770,7 @@ func anthropicCitation(annotation map[string]any, text string) map[string]any {
 func webSearchInput(item map[string]any) map[string]any {
 	action, _ := item["action"].(map[string]any)
 	input := map[string]any{}
-	for _, key := range []string{"query", "type"} {
+	for _, key := range []string{"query", "type", "url"} {
 		if value, exists := action[key]; exists {
 			input[key] = value
 		}
@@ -787,12 +787,9 @@ func webSearchResults(output []any, rawID string, titles map[string]string) []an
 			continue
 		}
 		action, _ := item["action"].(map[string]any)
-		sources, _ := action["sources"].([]any)
-		for _, rawSource := range sources {
-			source, _ := rawSource.(map[string]any)
-			url := stringValue(source["url"])
+		appendResult := func(url string) {
 			if url == "" || seen[url] {
-				continue
+				return
 			}
 			seen[url] = true
 			title := titles[url]
@@ -800,6 +797,12 @@ func webSearchResults(output []any, rawID string, titles map[string]string) []an
 				title = url
 			}
 			results = append(results, map[string]any{"type": "web_search_result", "url": url, "title": title})
+		}
+		appendResult(stringValue(action["url"]))
+		sources, _ := action["sources"].([]any)
+		for _, rawSource := range sources {
+			source, _ := rawSource.(map[string]any)
+			appendResult(stringValue(source["url"]))
 		}
 	}
 	if results == nil {
