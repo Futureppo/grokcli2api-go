@@ -341,6 +341,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	model := openai.String(body, "model", "")
 	affinity := requestAffinity(r, body)
 	convID := conversationID(affinity)
+	promptCacheKey := openai.String(body, "prompt_cache_key", "")
 	if !openai.IsStreaming(body) {
 		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 		if err != nil {
@@ -350,11 +351,15 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		if native {
 			writeJSON(w, http.StatusOK, payload)
 		} else {
-			writeJSON(w, http.StatusOK, compat.NormalizeResponse(payload, model))
+			normalized := compat.NormalizeResponse(payload, model)
+			// Index tool calls so Alma can continue with previous_response_id
+			// / item_reference without re-sending the matching function_call.
+			openai.RememberCompletedResponse(openai.DefaultToolReplay, model, normalized, promptCacheKey)
+			writeJSON(w, http.StatusOK, normalized)
 		}
 		return
 	}
-	s.streamResponses(w, r, wire, affinity, convID, model, native, compat)
+	s.streamResponses(w, r, wire, affinity, convID, model, native, compat, promptCacheKey)
 }
 
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
@@ -439,7 +444,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[str
 	flush()
 }
 
-func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string, native bool, compat *openai.ResponsesCompatibility) {
+func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string, native bool, compat *openai.ResponsesCompatibility, promptCacheKey string) {
 	stream, err := s.client.OpenStream(r.Context(), "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 	if err != nil {
 		s.writeClientError(w, err)
@@ -450,6 +455,10 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 	flush := flusher(w)
 	timing := grok.RequestTimingFromContext(r.Context())
 	timing.MarkDownstreamFlush(false)
+	// Accumulate tool calls from output_item.done, then index under
+	// prev-resp:{response.id} when response.completed arrives (done events
+	// often omit response_id, so early prev-resp writes can miss).
+	replay := &streamToolReplayState{model: model, promptCacheKey: promptCacheKey}
 	for {
 		event, ok, nextErr := stream.Next()
 		if nextErr != nil {
@@ -487,6 +496,7 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 						translatedEvent.Event = openai.EventType("", data)
 					}
 				}
+				replay.handle(translatedEvent.Event, translatedEvent.Data)
 				if err := writeRawSSE(w, translatedEvent); err != nil {
 					return
 				}
@@ -501,6 +511,78 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 		}
 		flush()
 		timing.MarkDownstreamFlush(responseEventHasText(event.Data))
+	}
+}
+
+// streamToolReplayState accumulates tool calls from a single Responses stream
+// (collect on output_item.done, cache on response.completed).
+type streamToolReplayState struct {
+	model          string
+	promptCacheKey string
+	responseID     string
+	// items holds function/custom tool calls from output_item.done, ordered.
+	items []map[string]any
+}
+
+func (s *streamToolReplayState) handle(event string, data []byte) {
+	if s == nil {
+		return
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return
+	}
+	kind := openai.EventType(event, payload)
+	if id := openai.String(payload, "response_id", ""); id != "" {
+		s.responseID = id
+	}
+	if response, ok := payload["response"].(map[string]any); ok {
+		if id := openai.String(response, "id", ""); id != "" {
+			s.responseID = id
+		}
+	}
+	switch kind {
+	case "response.created", "response.in_progress":
+		// Learn response id only.
+	case "response.output_item.done":
+		// Accumulate tool calls for patching completed.output if empty.
+		item, _ := payload["item"].(map[string]any)
+		if item == nil {
+			return
+		}
+		switch openai.String(item, "type", "") {
+		case "function_call", "custom_tool_call":
+			s.items = append(s.items, item)
+			// Index item:{id} immediately so item_reference works even when
+			// Alma continues before we see response.completed (partial turns).
+			// Do NOT write prev-resp here: done events often omit response_id
+			// and the session key is only committed on completed.
+			if id := openai.String(item, "id", ""); id != "" {
+				openai.RememberStreamToolCall(openai.DefaultToolReplay, s.model, item, "", "")
+			}
+		}
+	case "response.completed":
+		// Patch empty completed.output from collected done items, then index
+		// under prev-resp / item / session keys.
+		response, _ := payload["response"].(map[string]any)
+		if response == nil {
+			response = map[string]any{}
+		}
+		if id := openai.String(response, "id", ""); id != "" {
+			s.responseID = id
+		} else if s.responseID != "" {
+			response["id"] = s.responseID
+		}
+		if output, ok := response["output"].([]any); !ok || len(output) == 0 {
+			if len(s.items) > 0 {
+				patched := make([]any, 0, len(s.items))
+				for _, item := range s.items {
+					patched = append(patched, item)
+				}
+				response["output"] = patched
+			}
+		}
+		openai.RememberCompletedResponse(openai.DefaultToolReplay, s.model, response, s.promptCacheKey)
 	}
 }
 

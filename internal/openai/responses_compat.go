@@ -56,8 +56,30 @@ type StreamEvent struct {
 // PrepareCompatibleResponses maps current OpenAI/Codex Responses request
 // shapes to the subset understood by the Grok CLI upstream.
 func PrepareCompatibleResponses(body map[string]any) (map[string]any, *ResponsesCompatibility, error) {
+	return PrepareCompatibleResponsesWithCache(body, DefaultToolReplay)
+}
+
+// PrepareCompatibleResponsesWithCache is the testable entry point that accepts
+// an explicit tool-call replay cache (Alma multi-turn continuity).
+//
+// Pipeline (Alma/Codex multi-turn tool continuity):
+//  1. expand item_reference from cache
+//  2. re-insert missing function/custom calls for tool outputs (prev-resp / cache)
+//  3. normalize each input item (ModelInput hygiene, custom→function, drop residual refs)
+//  4. prune remaining orphan tool outputs
+//
+// Note: normalize runs after replay insert so cached custom_tool_call items
+// still go through this package's alias rewrite. Cached function_call items
+// are already minimal ModelInput shapes.
+func PrepareCompatibleResponsesWithCache(body map[string]any, cache *ToolReplayCache) (map[string]any, *ResponsesCompatibility, error) {
 	out := PrepareResponses(body)
 	removeEncryptedReasoningInclude(out)
+	// Grok CLI has no previous_response_id; affinity/replay consume it first.
+	previousResponseID := String(body, "previous_response_id", "")
+	promptCacheKey := String(body, "prompt_cache_key", "")
+	delete(out, "previous_response_id")
+	model := String(body, "model", "")
+
 	compat := &ResponsesCompatibility{
 		aliases:         make(map[string]toolIdentity),
 		originalAliases: make(map[string]string),
@@ -72,18 +94,18 @@ func PrepareCompatibleResponses(body map[string]any) (map[string]any, *Responses
 	}
 
 	if input, ok := out["input"].([]any); ok {
-		rewritten := make([]any, 0, len(input))
-		for index, raw := range input {
-			item, extra, err := compat.normalizeInputItem(raw, index)
-			if err != nil {
-				return nil, nil, err
-			}
-			sources = append(sources, extra...)
-			if item != nil {
-				rewritten = append(rewritten, item)
-			}
+		input = expandItemReferences(cache, model, input)
+		probe := map[string]any{"input": input}
+		applyToolCallReplay(cache, model, probe, previousResponseID, promptCacheKey)
+		input, _ = probe["input"].([]any)
+
+		rewritten, extra, err := compat.normalizeInputList(input)
+		if err != nil {
+			return nil, nil, err
 		}
+		sources = append(sources, extra...)
 		out["input"] = rewritten
+		pruneOrphanToolOutputs(out)
 	}
 
 	tools, err := compat.normalizeToolSources(sources)
@@ -97,6 +119,22 @@ func PrepareCompatibleResponses(body map[string]any) (map[string]any, *Responses
 	return out, compat, nil
 }
 
+func (c *ResponsesCompatibility) normalizeInputList(input []any) ([]any, []toolSource, error) {
+	rewritten := make([]any, 0, len(input))
+	sources := make([]toolSource, 0)
+	for index, raw := range input {
+		item, extra, err := c.normalizeInputItem(raw, index)
+		if err != nil {
+			return nil, nil, err
+		}
+		sources = append(sources, extra...)
+		if item != nil {
+			rewritten = append(rewritten, item)
+		}
+	}
+	return rewritten, sources, nil
+}
+
 func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []toolSource, error) {
 	item, ok := raw.(map[string]any)
 	if !ok {
@@ -107,11 +145,31 @@ func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []
 		return item, nil, nil
 	}
 	switch kind {
-	case "message", "function_call_output", "web_search_call":
+	case "message":
 		return sanitizeInputItem(item), nil, nil
+	case "function_call_output":
+		out := sanitizeInputItem(item)
+		out["output"] = flattenToolOutput(item["output"])
+		return out, nil, nil
+	// Server-tool history is not part of Grok CLI ModelInput. Codex re-sends
+	// visible search results as messages when needed; forwarding these items
+	// yields a hard upstream 422 (untagged enum ModelInput).
+	case "web_search_call", "x_search_call", "web_search", "x_search",
+		"computer_call", "computer_call_output",
+		"local_shell_call_output", "image_generation_call",
+		"code_interpreter_call", "file_search_call",
+		"mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response":
+		return nil, nil, nil
 	case "reasoning":
+		// Codex/Alma often re-send reasoning shells with content:null /
+		// encrypted_content:null. Null fields fail Grok's untagged ModelInput
+		// enum (422), so strip nulls. Foreign encrypted_content is never
+		// portable across the account pool.
 		out := sanitizeInputItem(item)
 		delete(out, "encrypted_content")
+		if out["content"] == nil {
+			delete(out, "content")
+		}
 		if !hasReasoningText(out) {
 			return nil, nil, nil
 		}
@@ -128,8 +186,14 @@ func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []
 		}
 		alias := c.alias(identity)
 		out["name"] = alias
+		// Grok ModelInput function_call.arguments must be a JSON string.
+		out["arguments"] = stringifyToolArguments(item["arguments"])
 		delete(out, "namespace")
 		return out, nil, nil
+	case "item_reference":
+		// Expanded earlier from the replay cache. Any leftover reference is not
+		// a Grok ModelInput variant and must not be forwarded.
+		return nil, nil, nil
 	case "additional_tools":
 		return nil, toolSources(item["tools"], true), nil
 	case "tool_search_call":
@@ -155,6 +219,7 @@ func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []
 	case "custom_tool_call_output":
 		out := sanitizeInputItem(item)
 		out["type"] = "function_call_output"
+		out["output"] = flattenToolOutput(item["output"])
 		delete(out, "name")
 		return out, nil, nil
 	case "agent_message":
@@ -508,6 +573,66 @@ func (c *ResponsesCompatibility) normalizeToolChoice(body map[string]any) {
 func encodeCustomInput(value any) string {
 	encoded, _ := json.Marshal(map[string]any{"input": value})
 	return string(encoded)
+}
+
+// stringifyToolArguments forces Grok ModelInput function_call.arguments to a
+// JSON string. Some clients send structured objects.
+func stringifyToolArguments(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return "{}"
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return "{}"
+		}
+		return typed
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return "{}"
+		}
+		return string(encoded)
+	}
+}
+
+// flattenToolOutput collapses array/object tool outputs into a single string
+// accepted by the Grok CLI function_call_output shape.
+func flattenToolOutput(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, entry := range typed {
+			switch part := entry.(type) {
+			case string:
+				parts = append(parts, part)
+			case map[string]any:
+				if text := String(part, "text", ""); text != "" {
+					parts = append(parts, text)
+					continue
+				}
+				encoded, err := json.Marshal(part)
+				if err == nil {
+					parts = append(parts, string(encoded))
+				}
+			default:
+				encoded, err := json.Marshal(part)
+				if err == nil {
+					parts = append(parts, string(encoded))
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return fmt.Sprint(typed)
+		}
+		return string(encoded)
+	}
 }
 
 func decodeCustomInput(value any) string {
