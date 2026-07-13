@@ -126,6 +126,71 @@ func TestPrepareCompatibleResponsesDropsUnknownInput(t *testing.T) {
 	}
 }
 
+func TestPrepareCompatibleResponsesRewritesAssistantOutputTextHistory(t *testing.T) {
+	wire, _, err := PrepareCompatibleResponses(map[string]any{
+		"model": "grok-4.5",
+		"input": []any{
+			map[string]any{
+				"type": "message", "role": "assistant", "id": "msg_1", "status": "completed",
+				"content": []any{map[string]any{"type": "output_text", "text": "first response"}},
+			},
+			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "continue"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := wire["input"].([]any)
+	message := input[0].(map[string]any)
+	content := message["content"].([]any)
+	part := content[0].(map[string]any)
+	if part["type"] != "input_text" || part["text"] != "first response" {
+		t.Fatalf("assistant history content = %#v", content)
+	}
+}
+
+func TestPrepareCompatibleResponsesDoesNotAddMissingMessageContent(t *testing.T) {
+	wire, _, err := PrepareCompatibleResponses(map[string]any{
+		"model": "grok-4.5",
+		"input": []any{
+			map[string]any{"type": "message", "role": "assistant", "tool_calls": []any{map[string]any{"id": "call_1", "type": "function"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := wire["input"].([]any)
+	message := input[0].(map[string]any)
+	if _, exists := message["content"]; exists {
+		t.Fatalf("missing content was added: %#v", message)
+	}
+}
+
+func TestPrepareCompatibleResponsesRewritesAnthropicImageContent(t *testing.T) {
+	wire, _, err := PrepareCompatibleResponses(map[string]any{
+		"model": "grok-4.5",
+		"input": []any{
+			map[string]any{
+				"type": "message", "role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "describe"},
+					map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := wire["input"].([]any)
+	message := input[0].(map[string]any)
+	content := message["content"].([]any)
+	image := content[1].(map[string]any)
+	if image["type"] != "input_image" || image["image_url"] != "data:image/png;base64,AAAA" {
+		t.Fatalf("image content = %#v", image)
+	}
+}
+
 func TestPrepareCompatibleResponsesNormalizesCodexHostedTools(t *testing.T) {
 	wire, _, err := PrepareCompatibleResponses(map[string]any{
 		"model": "grok-4.5", "input": "hello",

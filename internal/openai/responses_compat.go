@@ -202,7 +202,56 @@ func sanitizeInputItem(item map[string]any) map[string]any {
 	out := clone(item)
 	delete(out, "internal_chat_message_metadata_passthrough")
 	delete(out, "phase")
+	if content, exists := out["content"]; exists && String(out, "type", "") == "message" {
+		out["content"] = sanitizeMessageContent(content)
+	}
 	return out
+}
+
+func sanitizeMessageContent(content any) any {
+	parts, ok := content.([]any)
+	if !ok {
+		return content
+	}
+	out := make([]any, 0, len(parts))
+	for _, raw := range parts {
+		part, ok := raw.(map[string]any)
+		if !ok {
+			out = append(out, raw)
+			continue
+		}
+		clean := clone(part)
+		switch String(clean, "type", "") {
+		case "output_text":
+			clean["type"] = "input_text"
+		case "image":
+			if image := anthropicImageContent(clean); image != nil {
+				clean = image
+			}
+		}
+		out = append(out, clean)
+	}
+	return out
+}
+
+func anthropicImageContent(part map[string]any) map[string]any {
+	source, ok := part["source"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	var url string
+	switch String(source, "type", "") {
+	case "url":
+		url = String(source, "url", "")
+	case "base64":
+		url = "data:" + String(source, "media_type", "") + ";base64," + String(source, "data", "")
+	default:
+		return nil
+	}
+	if url == "" {
+		return nil
+	}
+	return map[string]any{"type": "input_image", "image_url": url, "detail": "auto"}
 }
 
 func hasReasoningText(item map[string]any) bool {
