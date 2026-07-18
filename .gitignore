@@ -6,7 +6,7 @@
 *.out
 coverage.out
 coverage.html
-
+/grok-build-main
 # Local configuration and secrets
 .env
 .env.local
