@@ -370,6 +370,8 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
   -H "X-Admin-Key: $GROK_ADMIN_KEY"
 ```
 
+When the upstream returns HTTP `403` with an `error` string exactly equal to `Access to the chat endpoint is denied. Please update the permissions.`, the service automatically deletes that logical credential and tries another account. Matching is case-, punctuation-, and whitespace-sensitive; a multi-scope file still loses only the rejected scope. If the file lock or write fails, the account is disabled first so it cannot be scheduled again.
+
 Administrator responses include `Cache-Control: no-store`. Uploads are limited to 1 MiB; the service validates the JSON, derives the destination from the account identity, and atomically writes it with mode `0600` instead of trusting the client filename. Prefer administration over loopback or an SSH tunnel. Cross-network access must use HTTPS with source and rate restrictions at the reverse proxy.
 
 ### Credential Pool and Scheduling

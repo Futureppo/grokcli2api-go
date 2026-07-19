@@ -370,6 +370,8 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
   -H "X-Admin-Key: $GROK_ADMIN_KEY"
 ```
 
+上游返回 HTTP `403` 且 `error` 文本逐字等于 `Access to the chat endpoint is denied. Please update the permissions.` 时，服务会自动删除命中的逻辑凭证并尝试其他账号。该规则区分大小写、标点和空白，不使用模糊匹配；多 scope 文件仍只删除被拒绝的 scope。若文件锁或写盘失败，账号会先被禁用，避免再次调度。
+
 管理接口响应带有 `Cache-Control: no-store`。上传文件限制为 1 MiB，服务会校验 JSON、使用账号身份生成保存路径并以 `0600` 权限原子写入，不会采用客户端提供的文件名。建议优先在服务器本机或 SSH 隧道中管理；如需跨网络访问，必须使用 HTTPS，并在反向代理层限制来源和频率。
 
 ### 凭证池与调度

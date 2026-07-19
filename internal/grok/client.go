@@ -31,9 +31,7 @@ import (
 
 const quotaErrorCode = "personal-team-blocked:spending-limit"
 
-const permanentChatDenialMessage = "access to the chat endpoint is denied"
-
-const genericAccessDenialMessage = "access denied"
+const permanentChatDenialMessage = "Access to the chat endpoint is denied. Please update the permissions."
 
 const permanentChatDenialReason = "chat_endpoint_denied"
 
@@ -392,7 +390,7 @@ func (c *Client) fetchAccountModelsPath(ctx context.Context, accountID string, r
 	if resp.StatusCode >= 400 {
 		apiErr := parseAPIError(resp, payload)
 		if isPermanentAccountDenial(apiErr) {
-			c.pool.Disable(accountID, permanentChatDenialReason)
+			c.deletePermanentlyDeniedCredential(accountID)
 			return modelFetchResult{}, apiErr
 		}
 		if isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
@@ -596,7 +594,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			lease.Release()
 			lastErr = apiErr
 			if isPermanentAccountDenial(apiErr) {
-				c.pool.Disable(accountID, permanentChatDenialReason)
+				c.deletePermanentlyDeniedCredential(accountID)
 				if len(used) < c.cfg.RetryMaxAttempts {
 					continue
 				}
@@ -724,7 +722,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			apiErr := parseAPIError(resp, data)
 			lastErr = apiErr
 			if isPermanentAccountDenial(apiErr) {
-				c.pool.Disable(accountID, permanentChatDenialReason)
+				c.deletePermanentlyDeniedCredential(accountID)
 				if len(used) < c.cfg.RetryMaxAttempts {
 					continue
 				}
@@ -904,20 +902,23 @@ func isAuthError(err *APIError) bool {
 }
 
 func isPermanentAccountDenial(err *APIError) bool {
-	if err == nil || err.Status != http.StatusForbidden {
-		return false
+	return err != nil && err.Status == http.StatusForbidden && err.UpstreamMessage == permanentChatDenialMessage
+}
+
+// deletePermanentlyDeniedCredential removes the exact logical credential
+// rejected by the upstream. DeleteCredential is scope-aware, so a denial for
+// one scope in a multi-scope auth.json does not remove its siblings. A failed
+// filesystem deletion falls back to disabling the account so it cannot be
+// scheduled again while the operator investigates the write/lock failure.
+func (c *Client) deletePermanentlyDeniedCredential(accountID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := c.pool.DeleteCredential(ctx, accountID); err != nil && !errors.Is(err, auth.ErrCredentialNotFound) {
+		c.pool.Disable(accountID, permanentChatDenialReason)
+		slog.Error("delete credential after exact chat endpoint denial failed", "account", accountID, "error", err)
+		return
 	}
-	text := strings.ToLower(strings.Join([]string{err.UpstreamCode, err.UpstreamMessage, err.Body}, " "))
-	if strings.Contains(text, permanentChatDenialMessage) {
-		return true
-	}
-	for _, candidate := range []string{err.UpstreamCode, err.UpstreamMessage, err.Body} {
-		normalized := strings.Trim(strings.ToLower(strings.TrimSpace(candidate)), " .!\t\r\n")
-		if normalized == genericAccessDenialMessage {
-			return true
-		}
-	}
-	return false
+	slog.Warn("credential deleted after exact chat endpoint denial", "account", accountID)
 }
 
 func isFreeModelQuotaExhausted(err *APIError) bool {

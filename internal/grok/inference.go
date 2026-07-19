@@ -141,6 +141,13 @@ func (c *Client) DoInference(ctx context.Context, plan *inference.RequestPlan, o
 			apiErr := parseAPIError(resp, body)
 			lease.Release()
 			lastErr = apiErr
+			if isPermanentAccountDenial(apiErr) {
+				c.deletePermanentlyDeniedCredential(accountID)
+				if pinned {
+					return nil, stateUnavailableError()
+				}
+				continue
+			}
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
 				if refreshErr := c.pool.RefreshIfUnchanged(ctx, accountID, generation); refreshErr == nil {
@@ -157,7 +164,7 @@ func (c *Client) DoInference(ctx context.Context, plan *inference.RequestPlan, o
 				}
 				continue
 			}
-			if isAuthError(apiErr) || isPermanentAccountDenial(apiErr) {
+			if isAuthError(apiErr) {
 				c.pool.Disable(accountID, "authentication_failed")
 				if pinned {
 					return nil, stateUnavailableError()
@@ -295,6 +302,13 @@ func (c *Client) OpenInference(ctx context.Context, plan *inference.RequestPlan,
 			}
 			apiErr := parseAPIError(resp, body)
 			lastErr = apiErr
+			if isPermanentAccountDenial(apiErr) {
+				c.deletePermanentlyDeniedCredential(accountID)
+				if pinned {
+					return nil, stateUnavailableError()
+				}
+				continue
+			}
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
 				if refreshErr := c.pool.RefreshIfUnchanged(ctx, accountID, generation); refreshErr == nil {
@@ -309,7 +323,7 @@ func (c *Client) OpenInference(ctx context.Context, plan *inference.RequestPlan,
 				}
 				continue
 			}
-			if isAuthError(apiErr) || isPermanentAccountDenial(apiErr) {
+			if isAuthError(apiErr) {
 				c.pool.Disable(accountID, "authentication_failed")
 				if pinned {
 					return nil, stateUnavailableError()

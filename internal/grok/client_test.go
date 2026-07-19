@@ -63,15 +63,17 @@ func TestPermanentAccountDenialDetection(t *testing.T) {
 		body   string
 		want   bool
 	}{
-		{name: "top-level error", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied. Please update permissions."}`, want: true},
-		{name: "nested error", status: http.StatusForbidden, body: `{"error":{"code":"permission_denied","message":"ACCESS TO THE CHAT ENDPOINT IS DENIED"}}`, want: true},
-		{name: "raw text", status: http.StatusForbidden, body: `Access to the chat endpoint is denied.`, want: true},
-		{name: "generic account denial", status: http.StatusForbidden, body: `{"error":"Access denied."}`, want: true},
-		{name: "generic raw denial", status: http.StatusForbidden, body: `Access denied.`, want: true},
+		{name: "exact top-level error", status: http.StatusForbidden, body: `{"status_code":403,"error":"Access to the chat endpoint is denied. Please update the permissions."}`, want: true},
+		{name: "exact nested error", status: http.StatusForbidden, body: `{"error":{"code":"permission_denied","message":"Access to the chat endpoint is denied. Please update the permissions."}}`, want: true},
+		{name: "missing the", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied. Please update permissions."}`},
+		{name: "different case", status: http.StatusForbidden, body: `{"error":"ACCESS TO THE CHAT ENDPOINT IS DENIED. PLEASE UPDATE THE PERMISSIONS."}`},
+		{name: "trailing whitespace", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied. Please update the permissions. "}`},
+		{name: "short denial", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied."}`},
+		{name: "generic account denial", status: http.StatusForbidden, body: `{"error":"Access denied."}`},
 		{name: "other forbidden", status: http.StatusForbidden, body: `{"error":"model access denied"}`},
 		{name: "quota forbidden", status: http.StatusForbidden, body: `{"code":"personal-team-blocked:spending-limit","error":"quota exhausted"}`},
-		{name: "unauthorized with matching text", status: http.StatusUnauthorized, body: `{"error":"Access to the chat endpoint is denied"}`},
-		{name: "rate limited", status: http.StatusTooManyRequests, body: `{"error":"Access to the chat endpoint is denied"}`},
+		{name: "unauthorized with exact text", status: http.StatusUnauthorized, body: `{"error":"Access to the chat endpoint is denied. Please update the permissions."}`},
+		{name: "rate limited with exact text", status: http.StatusTooManyRequests, body: `{"error":"Access to the chat endpoint is denied. Please update the permissions."}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -264,12 +266,12 @@ func TestRefreshAccountModelsUsesETagAndHandlesNotModified(t *testing.T) {
 	}
 }
 
-func TestRefreshModelsDisablesPermanentlyDeniedAccount(t *testing.T) {
+func TestRefreshModelsDeletesExactlyDeniedAccount(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Header.Get("Authorization") {
 		case "Bearer token-a":
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = io.WriteString(w, `{"error":"Access to the chat endpoint is denied"}`)
+			_, _ = io.WriteString(w, `{"status_code":403,"error":"Access to the chat endpoint is denied. Please update the permissions."}`)
 		case "Bearer token-b":
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "grok-4"}}})
 		default:
@@ -316,6 +318,12 @@ func TestRefreshModelsDisablesPermanentlyDeniedAccount(t *testing.T) {
 	}
 	if available != 1 {
 		t.Fatalf("available accounts=%d, want 1", available)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "account-a.json")); !os.IsNotExist(err) {
+		t.Fatalf("exactly denied credential file still exists or stat failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "account-b.json")); err != nil {
+		t.Fatalf("unrelated credential file was removed: %v", err)
 	}
 }
 
@@ -688,6 +696,129 @@ func TestUnauthorizedRetryRerendersForDifferentAccountDescriptor(t *testing.T) {
 	}
 	if result.Attempt.Backend != modelcatalog.BackendMessages || result.Attempt.ReasoningEffort != "low" || len(result.Attempt.Adapter.ToolAliases) != 0 {
 		t.Fatalf("result attempt = %#v", result.Attempt)
+	}
+}
+
+func TestExactChatDenialDeletesOnlyMatchingScope(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if got := r.Header.Get("Authorization"); got != "Bearer token-denied" {
+			t.Errorf("authorization = %q", got)
+		}
+		writeJSONResponse(t, w, http.StatusForbidden, map[string]any{
+			"status_code": float64(403), "error": permanentChatDenialMessage,
+		})
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	authPath := filepath.Join(dir, "auth.json")
+	expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	credential := map[string]any{"tokens": map[string]any{
+		"scope-denied": map[string]any{
+			"key": "token-denied", "auth_mode": "web_login", "user_id": "user-denied",
+			"principal_type": "team", "principal_id": "principal-denied", "expires_at": expires,
+		},
+		"scope-keep": map[string]any{
+			"key": "token-keep", "auth_mode": "web_login", "user_id": "user-keep",
+			"principal_type": "team", "principal_id": "principal-keep", "expires_at": expires,
+		},
+	}}
+	payload, err := json.Marshal(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(authPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: dir, Surface: "headless", ReloadInterval: time.Hour, RefreshConcurrency: 1,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 32,
+	}, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var deniedID, keepID string
+	for _, accountID := range pool.AccountIDs() {
+		lease, err := pool.AcquireAccount(context.Background(), accountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		token := lease.Session().Token
+		lease.Release()
+		descriptor := modelcatalog.ModelDescriptor{
+			WireModel: "wire-keep", Backend: modelcatalog.BackendChatCompletions, SupportedInAPI: true,
+		}
+		switch token {
+		case "token-denied":
+			deniedID = accountID
+			descriptor.ID, descriptor.WireModel = "grok-denied", "wire-denied"
+		case "token-keep":
+			keepID = accountID
+			descriptor.ID = "grok-keep"
+		default:
+			t.Fatalf("unexpected token %q", token)
+		}
+		if err := pool.UpdateModelDescriptors(accountID, []modelcatalog.ModelDescriptor{descriptor}, "", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if deniedID == "" || keepID == "" {
+		t.Fatalf("logical accounts not found: denied=%q keep=%q", deniedID, keepID)
+	}
+
+	cfg := config.Config{
+		ChatProxyBaseURL: upstream.URL, ChatProxyVersion: "v1", AuthsDir: dir,
+		AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, RetryMaxAttempts: 1,
+		RetryBaseDelay: time.Millisecond, AffinityTTL: time.Hour, AffinityMaxEntries: 32,
+		ClientVersion: "0.2.102", ClientMode: "headless", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
+	}
+	client, err := NewClient(cfg, pool, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	plan, err := inference.NewRequestPlan(inference.ProtocolChatCompletions, map[string]any{
+		"model": "grok-denied", "messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	}, inference.PlanOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.DoInference(context.Background(), plan, InferenceOptions{}); err == nil {
+		t.Fatal("exact denial unexpectedly succeeded")
+	} else {
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || !isPermanentAccountDenial(apiErr) {
+			t.Fatalf("error = %#v, want exact denial", err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls.Load())
+	}
+	if _, ok := pool.Credential(deniedID); ok {
+		t.Fatal("denied logical credential remains in the pool")
+	}
+	if _, ok := pool.Credential(keepID); !ok {
+		t.Fatal("sibling logical credential was removed")
+	}
+
+	written, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(written, &root); err != nil {
+		t.Fatal(err)
+	}
+	tokens, _ := root["tokens"].(map[string]any)
+	if _, exists := tokens["scope-denied"]; exists {
+		t.Fatalf("denied scope remains on disk: %s", written)
+	}
+	if _, exists := tokens["scope-keep"]; !exists || len(tokens) != 1 {
+		t.Fatalf("sibling scope was not preserved: %s", written)
 	}
 }
 
