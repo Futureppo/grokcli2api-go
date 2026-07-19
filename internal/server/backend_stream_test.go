@@ -368,6 +368,93 @@ func TestBackendStreamResponsesToChatUsesCompleteToolArguments(t *testing.T) {
 	}
 }
 
+func TestBackendStreamToolCallsUseProtocolTerminalReasons(t *testing.T) {
+	t.Run("responses to chat", func(t *testing.T) {
+		adapter := newBackendStreamAdapter(inference.ResponseAdapter{
+			ClientProtocol: inference.ProtocolChatCompletions, UpstreamBackend: modelcatalog.BackendResponses,
+		}, "grok-public")
+		inputs := []grok.SSEEvent{
+			{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}`)},
+			{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":1}}}`)},
+		}
+		var terminal map[string]any
+		for _, input := range inputs {
+			events, err := adapter.Handle(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, event := range events {
+				payload := decodeBackendStreamPayload(t, event)
+				choices, _ := payload["choices"].([]any)
+				if len(choices) > 0 && choices[0].(map[string]any)["finish_reason"] != nil {
+					terminal = choices[0].(map[string]any)
+				}
+			}
+		}
+		if terminal == nil || terminal["finish_reason"] != "tool_calls" {
+			t.Fatalf("terminal=%#v", terminal)
+		}
+	})
+
+	t.Run("chat to messages", func(t *testing.T) {
+		adapter := newBackendStreamAdapter(inference.ResponseAdapter{
+			ClientProtocol: inference.ProtocolMessages, UpstreamBackend: modelcatalog.BackendChatCompletions,
+		}, "grok-public")
+		inputs := []grok.SSEEvent{
+			{Data: []byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}`)},
+			{Data: []byte(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)},
+			{Data: []byte("[DONE]")},
+		}
+		stop := ""
+		for _, input := range inputs {
+			events, err := adapter.Handle(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, event := range events {
+				if event.Event != "message_delta" {
+					continue
+				}
+				payload := decodeBackendStreamPayload(t, event)
+				delta, _ := payload["delta"].(map[string]any)
+				stop = stringAt(delta, "stop_reason")
+			}
+		}
+		if stop != "tool_use" {
+			t.Fatalf("stop_reason=%q", stop)
+		}
+	})
+
+	t.Run("messages to chat", func(t *testing.T) {
+		adapter := newBackendStreamAdapter(inference.ResponseAdapter{
+			ClientProtocol: inference.ProtocolChatCompletions, UpstreamBackend: modelcatalog.BackendMessages,
+		}, "grok-public")
+		inputs := []grok.SSEEvent{
+			{Event: "content_block_start", Data: []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"lookup","input":{}}}`)},
+			{Event: "content_block_stop", Data: []byte(`{"type":"content_block_stop","index":0}`)},
+			{Event: "message_delta", Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}`)},
+			{Event: "message_stop", Data: []byte(`{"type":"message_stop"}`)},
+		}
+		stop := ""
+		for _, input := range inputs {
+			events, err := adapter.Handle(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, event := range events {
+				payload := decodeBackendStreamPayload(t, event)
+				choices, _ := payload["choices"].([]any)
+				if len(choices) > 0 {
+					stop = stringAt(choices[0].(map[string]any), "finish_reason")
+				}
+			}
+		}
+		if stop != "tool_calls" {
+			t.Fatalf("finish_reason=%q", stop)
+		}
+	})
+}
+
 func TestBackendStreamMessagesToolInputReachesChat(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -529,6 +616,45 @@ func TestBackendStreamChatToResponsesCompletesOutputItems(t *testing.T) {
 		if !strings.Contains(string(encoded), expected) {
 			t.Fatalf("%q missing from terminal output: %s", expected, encoded)
 		}
+	}
+}
+
+func TestBackendStreamChatBuffersFragmentedToolStart(t *testing.T) {
+	adapter := newBackendStreamAdapter(inference.ResponseAdapter{
+		ClientProtocol: inference.ProtocolResponses, UpstreamBackend: modelcatalog.BackendChatCompletions,
+	}, "grok-public")
+	inputs := []grok.SSEEvent{
+		{Data: []byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"arguments":"{\"city\":"}}]}}]}`)},
+		{Data: []byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"lookup","arguments":"\"Paris\"}"}}]}}]}`)},
+		{Data: []byte(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)},
+		{Data: []byte("[DONE]")},
+	}
+	var events []grok.SSEEvent
+	for _, input := range inputs {
+		out, err := adapter.Handle(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, out...)
+	}
+	added, arguments := 0, ""
+	for _, event := range events {
+		payload := decodeBackendStreamPayload(t, event)
+		switch event.Event {
+		case "response.output_item.added":
+			item, _ := payload["item"].(map[string]any)
+			if item["type"] == "function_call" {
+				added++
+				if item["call_id"] != "call_1" || item["name"] != "lookup" {
+					t.Fatalf("added item=%#v", item)
+				}
+			}
+		case "response.function_call_arguments.done":
+			arguments = stringAt(payload, "arguments")
+		}
+	}
+	if added != 1 || arguments != `{"city":"Paris"}` {
+		t.Fatalf("added=%d arguments=%q events=%#v", added, arguments, events)
 	}
 }
 

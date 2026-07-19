@@ -475,6 +475,8 @@ func chatStopReason(result canonicalResult) string {
 		return "tool_calls"
 	}
 	switch result.StopReason {
+	case "tool_calls", "tool_use":
+		return "tool_calls"
 	case "max_tokens", "max_output_tokens", "length", "model_context_window_exceeded":
 		return "length"
 	case "stop_sequence":
@@ -491,6 +493,8 @@ func messagesStopReason(result canonicalResult) string {
 		return "tool_use"
 	}
 	switch result.StopReason {
+	case "tool_calls", "tool_use":
+		return "tool_use"
 	case "max_tokens", "max_output_tokens", "length":
 		return "max_tokens"
 	case "stop_sequence":

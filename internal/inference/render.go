@@ -37,7 +37,7 @@ func (p *RequestPlan) renderChat(model string, descriptor modelcatalog.ModelDesc
 			tools = append(tools, map[string]any{"type": "function", "function": function})
 		}
 		out["tools"] = tools
-		if choice := chatToolChoice(p.body, common.tools); choice != nil {
+		if choice := chatToolChoice(p.body, common.tools, common.toolAliases); choice != nil {
 			out["tool_choice"] = choice
 		}
 	}
@@ -110,25 +110,12 @@ func renderChatMessages(messages []canonicalMessage) []any {
 	return out
 }
 
-func chatToolChoice(body map[string]any, tools []canonicalTool) any {
-	raw := body["tool_choice"]
-	if raw == nil {
-		raw = body["function_call"]
+func chatToolChoice(body map[string]any, tools []canonicalTool, aliases map[string]ToolAlias) any {
+	choice := parseToolChoice(body)
+	if choice.mode != "" {
+		return choice.mode
 	}
-	if choice, ok := raw.(string); ok {
-		switch choice {
-		case "none", "auto", "required":
-			return choice
-		default:
-			return nil
-		}
-	}
-	object, _ := raw.(map[string]any)
-	function, _ := object["function"].(map[string]any)
-	name := trimmedString(function["name"])
-	if name == "" {
-		name = trimmedString(object["name"])
-	}
+	name := toolChoiceWireName(choice, aliases)
 	if name == "" {
 		return nil
 	}
@@ -138,6 +125,74 @@ func chatToolChoice(body map[string]any, tools []canonicalTool) any {
 		}
 	}
 	return nil
+}
+
+func toolChoiceWireName(choice toolChoiceSpec, aliases map[string]ToolAlias) string {
+	if choice.name == "" {
+		return ""
+	}
+	for wire, alias := range aliases {
+		kindMatches := choice.kind == "tool" || choice.kind == alias.Kind || choice.kind == "function" && alias.Kind == "function"
+		if kindMatches && alias.Name == choice.name && alias.Namespace == choice.namespace {
+			return wire
+		}
+	}
+	return choice.name
+}
+
+type toolChoiceSpec struct {
+	mode      string
+	kind      string
+	name      string
+	namespace string
+}
+
+// parseToolChoice reduces the three public tool-choice dialects to the common
+// subset supported by all backends. Anthropic's any/tool spellings are mapped
+// to required/named here; renderers then encode that intent for their wire.
+func parseToolChoice(body map[string]any) toolChoiceSpec {
+	raw := body["tool_choice"]
+	if raw == nil {
+		raw = body["function_call"]
+	}
+	if value, ok := raw.(string); ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "none", "auto", "required":
+			return toolChoiceSpec{mode: strings.ToLower(strings.TrimSpace(value))}
+		}
+		return toolChoiceSpec{}
+	}
+	choice, _ := raw.(map[string]any)
+	kind := strings.ToLower(trimmedString(choice["type"]))
+	switch kind {
+	case "none", "auto":
+		return toolChoiceSpec{mode: kind}
+	case "any", "required":
+		return toolChoiceSpec{mode: "required"}
+	case "tool", "function", "custom":
+		function, _ := choice["function"].(map[string]any)
+		name := trimmedString(function["name"])
+		if name == "" {
+			name = trimmedString(choice["name"])
+		}
+		if name != "" {
+			return toolChoiceSpec{kind: kind, name: name, namespace: trimmedString(choice["namespace"])}
+		}
+	}
+	return toolChoiceSpec{}
+}
+
+func requestedParallelToolCalls(body map[string]any) (bool, bool) {
+	if value, exists := body["parallel_tool_calls"]; exists {
+		parallel, ok := value.(bool)
+		return parallel, ok
+	}
+	choice, _ := body["tool_choice"].(map[string]any)
+	if value, exists := choice["disable_parallel_tool_use"]; exists {
+		disabled, ok := value.(bool)
+		return !disabled, ok
+	}
+	return false, false
 }
 
 func (p *RequestPlan) renderResponses(model string, descriptor modelcatalog.ModelDescriptor) (map[string]any, bool, map[string]ToolAlias, error) {
@@ -167,7 +222,14 @@ func (p *RequestPlan) renderResponses(model string, descriptor modelcatalog.Mode
 		}
 	}
 	if len(common.tools) > 0 {
-		out["tools"] = renderResponsesTools(common.tools)
+		tools := renderResponsesTools(common.tools)
+		out["tools"] = tools
+		if choice := responsesToolChoice(p.body, tools, nil); choice != nil {
+			out["tool_choice"] = choice
+		}
+		if parallel, ok := requestedParallelToolCalls(p.body); ok {
+			out["parallel_tool_calls"] = parallel
+		}
 	}
 	if p.stream && descriptor.StreamToolCalls {
 		out["stream_tool_calls"] = true
@@ -199,6 +261,13 @@ func renderResponsesInput(messages []canonicalMessage) []any {
 	knownCalls := map[string]bool{}
 	for _, message := range messages {
 		var content []any
+		flushContent := func() {
+			if len(content) == 0 {
+				return
+			}
+			out = append(out, map[string]any{"type": "message", "role": message.role, "content": content})
+			content = nil
+		}
 		for _, block := range message.blocks {
 			switch block.kind {
 			case blockText:
@@ -215,17 +284,20 @@ func renderResponsesInput(messages []canonicalMessage) []any {
 				if message.role != "assistant" || block.id == "" || block.name == "" {
 					continue
 				}
+				flushContent()
 				knownCalls[block.id] = true
 				out = append(out, map[string]any{"type": "function_call", "call_id": block.id, "name": block.name, "arguments": block.arguments})
 			case blockToolResult:
 				if block.id == "" || !knownCalls[block.id] {
 					continue
 				}
+				flushContent()
 				out = append(out, map[string]any{"type": "function_call_output", "call_id": block.id, "output": outputString(block.output, block.isError)})
 			case blockReasoning:
 				if message.role != "assistant" || block.data == "" {
 					continue
 				}
+				flushContent()
 				item := map[string]any{"type": "reasoning", "encrypted_content": block.data}
 				if block.text != "" {
 					item["summary"] = []any{map[string]any{"type": "summary_text", "text": block.text}}
@@ -233,9 +305,7 @@ func renderResponsesInput(messages []canonicalMessage) []any {
 				out = append(out, item)
 			}
 		}
-		if len(content) > 0 {
-			out = append(out, map[string]any{"type": "message", "role": message.role, "content": content})
-		}
+		flushContent()
 	}
 	return out
 }
@@ -290,6 +360,7 @@ func (p *RequestPlan) renderNativeResponses(model string, descriptor modelcatalo
 	if rawInput == nil {
 		rawInput = p.body["messages"]
 	}
+	aliases = ensureResponseInputToolAliases(rawInput, aliases)
 	_, allowStatefulOutputs := p.body["previous_response_id"].(string)
 	input := rewriteNativeResponseInputAliases(cleanNativeResponsesInput(rawInput, allowStatefulOutputs), aliases)
 	switch input := input.(type) {
@@ -397,7 +468,7 @@ func (p *RequestPlan) renderNativeResponses(model string, descriptor modelcatalo
 	}
 	if len(tools) > 0 {
 		out["tools"] = tools
-		if choice := responsesToolChoice(p.body["tool_choice"], tools); choice != nil {
+		if choice := responsesToolChoice(p.body, tools, aliases); choice != nil {
 			out["tool_choice"] = choice
 		}
 	}
@@ -460,6 +531,9 @@ func (p *RequestPlan) renderMessages(model string, descriptor modelcatalog.Model
 			tools = append(tools, item)
 		}
 		out["tools"] = tools
+		if choice := messagesToolChoice(p.body, tools, common.toolAliases); choice != nil {
+			out["tool_choice"] = choice
+		}
 	}
 	return out, false, nil
 }

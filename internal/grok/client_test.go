@@ -689,14 +689,16 @@ func TestUnauthorizedRetryRerendersForDifferentAccountDescriptor(t *testing.T) {
 		t.Fatalf("second attempt = %#v", second)
 	}
 	secondOutput, _ := second.body["output_config"].(map[string]any)
-	if secondOutput["effort"] != "low" || second.body["reasoning"] != nil || second.body["tools"] != nil {
+	secondTools, _ := second.body["tools"].([]any)
+	if secondOutput["effort"] != "low" || second.body["reasoning"] != nil || len(secondTools) != 1 || secondTools[0].(map[string]any)["name"] != "ns__lookup" || second.body["tool_choice"] != nil {
 		t.Fatalf("second attempt was not rerendered and silently cleaned: %#v", second.body)
 	}
 	if first.requestID != second.requestID || first.sessionID != second.sessionID || first.turn != second.turn ||
 		first.requestID != "logical-request" || first.sessionID != "logical-session" || first.turn != "0" {
 		t.Fatalf("logical identity changed across retry: first=%#v second=%#v", first, second)
 	}
-	if result.Attempt.Backend != modelcatalog.BackendMessages || result.Attempt.ReasoningEffort != "low" || len(result.Attempt.Adapter.ToolAliases) != 0 {
+	alias := result.Attempt.Adapter.ToolAliases["ns__lookup"]
+	if result.Attempt.Backend != modelcatalog.BackendMessages || result.Attempt.ReasoningEffort != "low" || alias.Name != "lookup" || alias.Namespace != "ns__" {
 		t.Fatalf("result attempt = %#v", result.Attempt)
 	}
 }

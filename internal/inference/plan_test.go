@@ -714,8 +714,325 @@ func TestResponsesToolAliasesAreAttemptLocalAndDescriptorRerendered(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(chat.Adapter.ToolAliases) != 0 {
-		t.Fatalf("chat attempt leaked prior alias state: %#v", chat.Adapter.ToolAliases)
+	chatAlias := chat.Adapter.ToolAliases["calendar__create"]
+	if chatAlias.Name != "create" || chatAlias.Namespace != "calendar__" || chatAlias.Kind != "function" {
+		t.Fatalf("chat attempt lost rerendered alias state: %#v", chat.Adapter.ToolAliases)
+	}
+}
+
+func TestToolChoiceAndParallelIntentRenderAcrossBackends(t *testing.T) {
+	tests := []struct {
+		name       string
+		protocol   Protocol
+		body       map[string]any
+		chatChoice any
+		respChoice any
+		msgChoice  any
+	}{
+		{
+			name: "chat named choice", protocol: ProtocolChatCompletions,
+			body: map[string]any{
+				"model": "m", "messages": []any{map[string]any{"role": "user", "content": "lookup"}},
+				"tools":               []any{map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}}},
+				"tool_choice":         map[string]any{"type": "function", "function": map[string]any{"name": "lookup"}},
+				"parallel_tool_calls": false,
+			},
+			chatChoice: map[string]any{"type": "function", "function": map[string]any{"name": "lookup"}},
+			respChoice: map[string]any{"type": "function", "name": "lookup"},
+			msgChoice:  map[string]any{"type": "tool", "name": "lookup", "disable_parallel_tool_use": true},
+		},
+		{
+			name: "messages required choice", protocol: ProtocolMessages,
+			body: map[string]any{
+				"model": "m", "max_tokens": float64(64), "messages": []any{map[string]any{"role": "user", "content": "lookup"}},
+				"tools":       []any{map[string]any{"name": "lookup", "input_schema": map[string]any{"type": "object"}}},
+				"tool_choice": map[string]any{"type": "any", "disable_parallel_tool_use": true},
+			},
+			chatChoice: "required", respChoice: "required",
+			msgChoice: map[string]any{"type": "any", "disable_parallel_tool_use": true},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan := mustPlan(t, test.protocol, test.body)
+			chat, err := plan.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendChatCompletions})
+			if err != nil || !reflect.DeepEqual(chat.Body["tool_choice"], test.chatChoice) {
+				t.Fatalf("chat choice=%#v err=%v body=%#v", chat.Body["tool_choice"], err, chat.Body)
+			}
+			responses, err := plan.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendResponses})
+			if err != nil || !reflect.DeepEqual(responses.Body["tool_choice"], test.respChoice) || responses.Body["parallel_tool_calls"] != false {
+				t.Fatalf("responses choice=%#v err=%v body=%#v", responses.Body["tool_choice"], err, responses.Body)
+			}
+			messages, err := plan.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendMessages})
+			if err != nil || !reflect.DeepEqual(messages.Body["tool_choice"], test.msgChoice) {
+				t.Fatalf("messages choice=%#v err=%v body=%#v", messages.Body["tool_choice"], err, messages.Body)
+			}
+		})
+	}
+}
+
+func TestNativeResponsesToolChoiceUsesFlattenedAlias(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		tool   map[string]any
+		choice map[string]any
+	}{
+		{
+			name: "namespace",
+			tool: map[string]any{"type": "namespace", "name": "calendar__", "tools": []any{
+				map[string]any{"type": "function", "name": "create", "parameters": map[string]any{"type": "object"}},
+			}},
+			choice: map[string]any{"type": "function", "name": "create", "namespace": "calendar__"},
+		},
+		{
+			name:   "custom",
+			tool:   map[string]any{"type": "custom", "name": "shell", "description": "run code"},
+			choice: map[string]any{"type": "custom", "name": "shell"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan := mustPlan(t, ProtocolResponses, map[string]any{
+				"model": "m", "input": "use tool", "tools": []any{test.tool}, "tool_choice": test.choice,
+			})
+			attempt, err := plan.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendResponses})
+			if err != nil {
+				t.Fatal(err)
+			}
+			choice, _ := attempt.Body["tool_choice"].(map[string]any)
+			wireName := trimmedString(choice["name"])
+			if trimmedString(choice["type"]) != "function" || wireName == "" {
+				t.Fatalf("choice=%#v body=%#v", choice, attempt.Body)
+			}
+			if alias, ok := attempt.Adapter.RestoreTool(wireName); !ok || alias.Name != trimmedString(test.choice["name"]) {
+				t.Fatalf("wire choice %q has no matching alias: %#v", wireName, attempt.Adapter.ToolAliases)
+			}
+		})
+	}
+}
+
+func TestResponsesExtendedToolsRemainPortableAcrossBackends(t *testing.T) {
+	plan := mustPlan(t, ProtocolResponses, map[string]any{
+		"model": "m", "input": "use tools",
+		"tools": []any{
+			map[string]any{"type": "namespace", "name": "calendar__", "tools": []any{
+				map[string]any{"type": "function", "name": "create", "parameters": map[string]any{"type": "object"}},
+			}},
+			map[string]any{"type": "custom", "name": "shell", "description": "run code"},
+		},
+	})
+	for _, backend := range []modelcatalog.Backend{modelcatalog.BackendChatCompletions, modelcatalog.BackendMessages} {
+		t.Run(string(backend), func(t *testing.T) {
+			attempt, err := plan.Render(modelcatalog.ModelDescriptor{Backend: backend})
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded := outputString(attempt.Body["tools"], false)
+			for _, name := range []string{"calendar__create", "shell"} {
+				if !contains(encoded, name) {
+					t.Fatalf("%s tool missing from %s wire: %s", name, backend, encoded)
+				}
+			}
+			calendar := attempt.Adapter.ToolAliases["calendar__create"]
+			shell := attempt.Adapter.ToolAliases["shell"]
+			if calendar.Name != "create" || calendar.Namespace != "calendar__" || shell.Name != "shell" || shell.Kind != "custom" {
+				t.Fatalf("aliases=%#v", attempt.Adapter.ToolAliases)
+			}
+			if _, exists := attempt.Body["tool_choice"]; exists {
+				t.Fatalf("missing public tool choice became an empty wire object: %#v", attempt.Body["tool_choice"])
+			}
+			if !contains(encoded, `"input"`) {
+				t.Fatalf("custom tool wrapper schema missing: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestNativeMessagesDoesNotSynthesizeEmptyToolChoice(t *testing.T) {
+	plan := mustPlan(t, ProtocolMessages, map[string]any{
+		"model": "m", "max_tokens": float64(64),
+		"messages": []any{map[string]any{"role": "user", "content": "lookup"}},
+		"tools":    []any{map[string]any{"name": "lookup", "input_schema": map[string]any{"type": "object"}}},
+	})
+	attempt, err := plan.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendMessages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := attempt.Body["tool_choice"]; exists {
+		t.Fatalf("tool_choice=%#v", attempt.Body["tool_choice"])
+	}
+}
+
+func TestResponsesCustomToolHistoryUsesPortableObjectWrapper(t *testing.T) {
+	plan := mustPlan(t, ProtocolResponses, map[string]any{
+		"model": "m",
+		"input": []any{
+			map[string]any{"type": "custom_tool_call", "call_id": "call_1", "name": "shell", "input": "echo hello"},
+			map[string]any{"type": "custom_tool_call_output", "call_id": "call_1", "output": "hello"},
+		},
+		"tools": []any{map[string]any{"type": "custom", "name": "shell"}},
+	})
+	for _, backend := range []modelcatalog.Backend{modelcatalog.BackendChatCompletions, modelcatalog.BackendMessages} {
+		t.Run(string(backend), func(t *testing.T) {
+			attempt, err := plan.Render(modelcatalog.ModelDescriptor{Backend: backend})
+			if err != nil {
+				t.Fatal(err)
+			}
+			messages := attempt.Body["messages"].([]any)
+			wrapped := false
+			if backend == modelcatalog.BackendChatCompletions {
+				calls := messages[0].(map[string]any)["tool_calls"].([]any)
+				function := calls[0].(map[string]any)["function"].(map[string]any)
+				wrapped = function["arguments"] == `{"input":"echo hello"}`
+			} else {
+				content := messages[0].(map[string]any)["content"].([]any)
+				input, _ := content[0].(map[string]any)["input"].(map[string]any)
+				wrapped = input["input"] == "echo hello"
+			}
+			if !wrapped {
+				t.Fatalf("custom history was not wrapped on %s: %#v", backend, attempt.Body)
+			}
+		})
+	}
+}
+
+func TestToolSearchContinuationLoadsToolsWithoutUnresolvedShimCall(t *testing.T) {
+	plan := mustPlan(t, ProtocolResponses, map[string]any{
+		"model": "m",
+		"input": []any{
+			map[string]any{"type": "tool_search_call", "call_id": "search_1", "execution": "client", "arguments": map[string]any{"goal": "calendar"}},
+			map[string]any{"type": "tool_search_output", "call_id": "search_1", "execution": "client", "tools": []any{
+				map[string]any{"type": "function", "name": "calendar_create", "defer_loading": true, "parameters": map[string]any{"type": "object"}},
+			}},
+			map[string]any{"type": "message", "role": "user", "content": "continue"},
+		},
+	})
+	for _, backend := range []modelcatalog.Backend{modelcatalog.BackendChatCompletions, modelcatalog.BackendResponses, modelcatalog.BackendMessages} {
+		t.Run(string(backend), func(t *testing.T) {
+			attempt, err := plan.Render(modelcatalog.ModelDescriptor{Backend: backend})
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded := outputString(attempt.Body, false)
+			if !contains(encoded, "calendar_create") || !contains(encoded, toolSearchCompletedText) || contains(encoded, "grokcli2api_tool_search") {
+				t.Fatalf("tool-search continuation on %s=%s", backend, encoded)
+			}
+		})
+	}
+}
+
+func TestNativeResponsesHardensToolArgumentAndOutputShapes(t *testing.T) {
+	plan := mustPlan(t, ProtocolResponses, map[string]any{
+		"model": "m",
+		"input": []any{
+			map[string]any{"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": map[string]any{"city": "Paris"}},
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": []any{
+				map[string]any{"type": "text", "text": "sunny"}, map[string]any{"temperature": 26},
+			}},
+		},
+		"tools": []any{map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}}},
+	})
+	attempt, err := plan.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendResponses})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := attempt.Body["input"].([]any)
+	call, output := input[0].(map[string]any), input[1].(map[string]any)
+	if call["arguments"] != `{"city":"Paris"}` || output["output"] != "sunny\n{\"temperature\":26}" {
+		t.Fatalf("input=%#v", input)
+	}
+}
+
+func TestResponsesHistoryBuildsAliasesWithoutRepeatedToolDefinitions(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call map[string]any
+		kind string
+	}{
+		{
+			name: "namespace",
+			call: map[string]any{"type": "function_call", "call_id": "call_1", "name": "create", "namespace": "calendar__", "arguments": `{}`},
+			kind: "function",
+		},
+		{
+			name: "custom",
+			call: map[string]any{"type": "custom_tool_call", "call_id": "call_1", "name": "shell", "input": "echo hi"},
+			kind: "custom",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan := mustPlan(t, ProtocolResponses, map[string]any{
+				"model": "m", "input": []any{
+					test.call,
+					map[string]any{"type": map[string]string{"function": "function_call_output", "custom": "custom_tool_call_output"}[test.kind], "call_id": "call_1", "output": "done"},
+				},
+			})
+			attempt, err := plan.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendResponses})
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := attempt.Body["input"].([]any)
+			wireCall := input[0].(map[string]any)
+			wireName := trimmedString(wireCall["name"])
+			alias, ok := attempt.Adapter.RestoreTool(wireName)
+			if !ok || alias.Kind != test.kind || wireCall["type"] != "function_call" || wireCall["namespace"] != nil {
+				t.Fatalf("input=%#v aliases=%#v", input, attempt.Adapter.ToolAliases)
+			}
+		})
+	}
+}
+
+func TestNativeResponsesKeepsToolSearchContractAndDefaultsFunctionSchema(t *testing.T) {
+	plan := mustPlan(t, ProtocolResponses, map[string]any{
+		"model": "m", "input": "find a tool",
+		"tools": []any{
+			map[string]any{"type": "function", "name": "parameterless"},
+			map[string]any{
+				"type": "tool_search", "description": "Find the exact integration",
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}, "required": []any{"query"}},
+			},
+		},
+	})
+	attempt, err := plan.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendResponses})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := attempt.Body["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools=%#v", tools)
+	}
+	byName := map[string]map[string]any{}
+	for _, raw := range tools {
+		tool := raw.(map[string]any)
+		byName[trimmedString(tool["name"])] = tool
+	}
+	parameterless := byName["parameterless"]
+	search := byName["grokcli2api_tool_search"]
+	searchSchema, _ := search["parameters"].(map[string]any)
+	properties, _ := searchSchema["properties"].(map[string]any)
+	if parameterless == nil || search == nil || !contains(stringValue(search["description"]), "exact integration") || properties["query"] == nil {
+		t.Fatalf("tools=%#v", tools)
+	}
+}
+
+func TestResponsesRenderingPreservesContentAndToolItemOrder(t *testing.T) {
+	plan := mustPlan(t, ProtocolChatCompletions, map[string]any{
+		"model": "m",
+		"messages": []any{
+			map[string]any{"role": "assistant", "content": "before", "tool_calls": []any{map[string]any{
+				"id": "call_1", "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{}`},
+			}}},
+			map[string]any{"role": "tool", "tool_call_id": "call_1", "content": "result"},
+		},
+	})
+	attempt, err := plan.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendResponses})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := attempt.Body["input"].([]any)
+	if len(input) != 3 || trimmedString(input[0].(map[string]any)["type"]) != "message" ||
+		trimmedString(input[1].(map[string]any)["type"]) != "function_call" ||
+		trimmedString(input[2].(map[string]any)["type"]) != "function_call_output" {
+		t.Fatalf("input order=%#v", input)
 	}
 }
 

@@ -46,6 +46,7 @@ type canonicalTool struct {
 type canonicalRequest struct {
 	messages    []canonicalMessage
 	tools       []canonicalTool
+	toolAliases map[string]ToolAlias
 	maxTokens   any
 	temperature any
 	topP        any
@@ -194,6 +195,7 @@ func canonicalFromResponses(body map[string]any) canonicalRequest {
 		maxTokens:   first(body, "max_output_tokens", "max_completion_tokens", "max_tokens"),
 		temperature: body["temperature"], topP: body["top_p"],
 	}
+	request.tools, request.toolAliases = responsesTools(responseToolSources(body))
 	request.user = firstString(body, "safety_identifier", "user")
 	if text, ok := body["text"].(map[string]any); ok {
 		request.format = text["format"]
@@ -208,6 +210,7 @@ func canonicalFromResponses(body map[string]any) canonicalRequest {
 	if !exists {
 		rawInput = body["messages"]
 	}
+	request.toolAliases = ensureResponseInputToolAliases(rawInput, request.toolAliases)
 	if text, ok := rawInput.(string); ok {
 		request.messages = append(request.messages, canonicalMessage{role: "user", blocks: []canonicalBlock{{kind: blockText, text: text}}})
 	} else if input, ok := rawInput.([]any); ok {
@@ -241,11 +244,21 @@ func canonicalFromResponses(body map[string]any) canonicalRequest {
 				if id == "" || name == "" {
 					continue
 				}
-				args := stringValue(item["arguments"])
-				if kind == "custom_tool_call" {
-					args = jsonString(item["input"])
+				wireName, identity := responseToolWireIdentity(kind, name, trimmedString(item["namespace"]), request.toolAliases)
+				if wireName != "" {
+					name = wireName
 				}
-				request.messages = append(request.messages, canonicalMessage{role: "assistant", blocks: []canonicalBlock{{kind: blockToolCall, id: id, name: name, arguments: args, input: cloneValue(item["input"])}}})
+				args := stringifyFunctionArguments(item["arguments"])
+				input := cloneValue(item["input"])
+				if kind == "custom_tool_call" {
+					input = map[string]any{"input": input}
+					args = jsonString(input)
+				} else if identity.Kind == "custom" {
+					// A cached/replayed custom call may already be represented as a
+					// function call. Keep its portable wrapper intact.
+					input = decodeObject(args)
+				}
+				request.messages = append(request.messages, canonicalMessage{role: "assistant", blocks: []canonicalBlock{{kind: blockToolCall, id: id, name: name, arguments: args, input: input}}})
 			case "function_call_output", "custom_tool_call_output":
 				id := trimmedString(item["call_id"])
 				if id == "" {
@@ -254,10 +267,13 @@ func canonicalFromResponses(body map[string]any) canonicalRequest {
 				if output, ok := portableOutput(item["output"]); ok {
 					request.messages = append(request.messages, canonicalMessage{role: "tool", blocks: []canonicalBlock{{kind: blockToolResult, id: id, output: output}}})
 				}
+			case "tool_search_output":
+				if clientToolExecution(item) {
+					request.messages = append(request.messages, canonicalMessage{role: "system", blocks: []canonicalBlock{{kind: blockText, text: toolSearchCompletedText}}})
+				}
 			}
 		}
 	}
-	request.tools = responsesTools(body["tools"])
 	return request
 }
 
@@ -289,8 +305,9 @@ func responsesContent(raw any, role string) []canonicalBlock {
 	return out
 }
 
-func responsesTools(raw any) []canonicalTool {
-	tools, _ := raw.([]any)
+func responsesTools(raw any) ([]canonicalTool, map[string]ToolAlias) {
+	items, _ := raw.([]any)
+	tools, aliases := cleanNativeResponsesTools(items, false)
 	var out []canonicalTool
 	seen := map[string]bool{}
 	for _, rawTool := range tools {
@@ -298,23 +315,34 @@ func responsesTools(raw any) []canonicalTool {
 		if !ok {
 			continue
 		}
-		kind := strings.ToLower(trimmedString(tool["type"]))
-		if kind != "function" && kind != "custom" {
+		if strings.ToLower(trimmedString(tool["type"])) != "function" {
 			continue
 		}
 		name := trimmedString(tool["name"])
 		parameters, ok := tool["parameters"].(map[string]any)
-		if kind == "custom" && !ok {
-			parameters = map[string]any{"type": "object"}
-			ok = true
-		}
 		if name == "" || !ok || seen[name] {
 			continue
 		}
 		seen[name] = true
 		out = append(out, canonicalTool{name: name, description: stringValue(tool["description"]), parameters: cloneMap(parameters)})
 	}
-	return out
+	return out, aliases
+}
+
+func responseToolWireIdentity(kind, name, namespace string, aliases map[string]ToolAlias) (string, ToolAlias) {
+	wantKind := "function"
+	if kind == "custom_tool_call" {
+		wantKind = "custom"
+	}
+	for wire, alias := range aliases {
+		if alias.Name == name && alias.Namespace == namespace && alias.Kind == wantKind {
+			return wire, alias
+		}
+	}
+	if alias, ok := aliases[name]; ok {
+		return name, alias
+	}
+	return "", ToolAlias{}
 }
 
 func canonicalFromMessages(body map[string]any) canonicalRequest {

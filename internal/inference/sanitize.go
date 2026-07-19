@@ -190,11 +190,7 @@ func cleanNativeResponsesInput(raw any, allowStatefulOutputs bool) any {
 				clean["id"] = id
 			}
 			if kind == "function_call" {
-				if args, ok := item["arguments"].(string); ok {
-					clean["arguments"] = args
-				} else {
-					continue
-				}
+				clean["arguments"] = stringifyFunctionArguments(item["arguments"])
 			} else if item["input"] != nil {
 				clean["input"] = cloneValue(item["input"])
 			} else {
@@ -202,20 +198,25 @@ func cleanNativeResponsesInput(raw any, allowStatefulOutputs bool) any {
 			}
 			out = append(out, clean)
 		case "tool_search_call":
-			callID := trimmedString(item["call_id"])
-			if callID == "" || !strings.EqualFold(firstString(item, "execution"), "client") {
+			// Client-side tool search is represented to the upstream by the
+			// newly loaded declarations plus the developer marker below. Keeping
+			// the call without a matching ModelInput output leaves an unresolved
+			// function turn and commonly causes another search loop.
+			continue
+		case "tool_search_output":
+			if !clientToolExecution(item) {
 				continue
 			}
 			out = append(out, map[string]any{
-				"type": "function_call", "call_id": callID, "name": "grokcli2api_tool_search",
-				"arguments": jsonString(item["arguments"]),
+				"type": "message", "role": "developer",
+				"content": []any{map[string]any{"type": "input_text", "text": toolSearchCompletedText}},
 			})
 		case "function_call_output", "custom_tool_call_output":
 			callID := trimmedString(item["call_id"])
 			if callID == "" || item["output"] == nil {
 				continue
 			}
-			out = append(out, map[string]any{"type": kind, "call_id": callID, "output": cloneValue(item["output"])})
+			out = append(out, map[string]any{"type": kind, "call_id": callID, "output": flattenFunctionOutput(item["output"])})
 		case "reasoning":
 			clean := map[string]any{"type": "reasoning"}
 			for _, key := range []string{"id", "encrypted_content", "status"} {
@@ -269,6 +270,41 @@ func cleanNativeResponsesInput(raw any, allowStatefulOutputs bool) any {
 		filtered = append(filtered, rawItem)
 	}
 	return filtered
+}
+
+const toolSearchCompletedText = "Tool search completed; the selected tools are now available."
+
+func stringifyFunctionArguments(value any) string {
+	if text, ok := value.(string); ok {
+		if strings.TrimSpace(text) == "" {
+			return "{}"
+		}
+		return text
+	}
+	return jsonString(value)
+}
+
+func flattenFunctionOutput(value any) string {
+	switch value := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	case []any:
+		parts := make([]string, 0, len(value))
+		for _, rawPart := range value {
+			if part, ok := rawPart.(map[string]any); ok {
+				if text, ok := part["text"].(string); ok {
+					parts = append(parts, text)
+					continue
+				}
+			}
+			parts = append(parts, jsonString(rawPart))
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return jsonString(value)
+	}
 }
 
 func rewriteNativeResponseInputAliases(raw any, aliases map[string]ToolAlias) any {
@@ -368,7 +404,7 @@ func responseToolSources(body map[string]any) []any {
 	input, _ := body["input"].([]any)
 	for _, rawItem := range input {
 		item, _ := rawItem.(map[string]any)
-		if trimmedString(item["type"]) != "tool_search_output" || !strings.EqualFold(firstString(item, "execution"), "client") {
+		if trimmedString(item["type"]) != "tool_search_output" || !clientToolExecution(item) {
 			continue
 		}
 		loaded, _ := item["tools"].([]any)
@@ -385,41 +421,27 @@ func responseToolSources(body map[string]any) []any {
 
 func cleanNativeResponsesTools(tools []any, allowSearch bool) ([]any, map[string]ToolAlias) {
 	aliases := map[string]ToolAlias{}
-	originals := map[string]string{}
 	positions := map[string]int{}
 	var out []any
 	clientSearch := false
+	searchDescription := ""
+	var searchParameters map[string]any
 	for _, rawTool := range tools {
 		tool, _ := rawTool.(map[string]any)
-		if trimmedString(tool["type"]) == "tool_search" && strings.EqualFold(firstString(tool, "execution"), "client") {
+		if trimmedString(tool["type"]) == "tool_search" && clientToolExecution(tool) {
 			clientSearch = true
+			if searchDescription == "" {
+				searchDescription = stringValue(tool["description"])
+			}
+			if searchParameters == nil {
+				if parameters, ok := tool["parameters"].(map[string]any); ok {
+					searchParameters = cloneMap(parameters)
+				}
+			}
 		}
 	}
 	alias := func(identity ToolAlias) string {
-		key := identity.Kind + "\x00" + identity.Namespace + "\x00" + identity.Name + "\x00" + identity.Execution
-		if existing := originals[key]; existing != "" {
-			return existing
-		}
-		base := identity.Namespace + identity.Name
-		if identity.Kind == "tool_search" {
-			base = "grokcli2api_tool_search"
-		}
-		if base == "" {
-			base = "grokcli2api_tool"
-		}
-		wire := base
-		if len(wire) > 128 {
-			wire = wire[:117] + "__" + inferenceShortHash(key)
-		}
-		if existing, collision := aliases[wire]; collision && existing != identity {
-			limit := 117
-			if len(base) < limit {
-				limit = len(base)
-			}
-			wire = base[:limit] + "__" + inferenceShortHash(key)
-		}
-		aliases[wire], originals[key] = identity, wire
-		return wire
+		return ensureToolAlias(aliases, identity)
 	}
 	add := func(tool map[string]any) {
 		key := trimmedString(tool["type"]) + "\x00" + trimmedString(tool["name"])
@@ -438,6 +460,10 @@ func cleanNativeResponsesTools(tools []any, allowSearch bool) ([]any, map[string
 		case "function":
 			name := trimmedString(tool["name"])
 			parameters, ok := tool["parameters"].(map[string]any)
+			if !ok && tool["parameters"] == nil {
+				parameters = map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": true}
+				ok = true
+			}
 			if name == "" || !ok {
 				return
 			}
@@ -500,13 +526,19 @@ func cleanNativeResponsesTools(tools []any, allowSearch bool) ([]any, map[string
 	}
 	if clientSearch {
 		identity := ToolAlias{Kind: "tool_search", Name: "tool_search", Execution: "client"}
-		description := "Search for tools needed to continue the task."
+		description := searchDescription
+		if strings.TrimSpace(description) == "" {
+			description = "Search for tools needed to continue the task."
+		}
 		if len(deferred) > 0 {
 			description += " Available deferred tools: " + strings.Join(deferred, ", ")
 		}
+		if searchParameters == nil {
+			searchParameters = map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": true}
+		}
 		add(map[string]any{
 			"type": "function", "name": alias(identity), "description": description,
-			"parameters": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": true},
+			"parameters": searchParameters,
 		})
 	}
 	if len(aliases) == 0 {
@@ -515,31 +547,152 @@ func cleanNativeResponsesTools(tools []any, allowSearch bool) ([]any, map[string
 	return out, aliases
 }
 
+func ensureResponseInputToolAliases(raw any, aliases map[string]ToolAlias) map[string]ToolAlias {
+	input, _ := raw.([]any)
+	for _, rawItem := range input {
+		item, _ := rawItem.(map[string]any)
+		kind := strings.ToLower(trimmedString(item["type"]))
+		if kind != "function_call" && kind != "custom_tool_call" {
+			continue
+		}
+		name := trimmedString(item["name"])
+		if name == "" {
+			continue
+		}
+		if _, alreadyWireName := aliases[name]; alreadyWireName && trimmedString(item["namespace"]) == "" {
+			continue
+		}
+		if aliases == nil {
+			aliases = make(map[string]ToolAlias)
+		}
+		identityKind := "function"
+		if kind == "custom_tool_call" {
+			identityKind = "custom"
+		}
+		ensureToolAlias(aliases, ToolAlias{Kind: identityKind, Name: name, Namespace: trimmedString(item["namespace"])})
+	}
+	return aliases
+}
+
+func ensureToolAlias(aliases map[string]ToolAlias, identity ToolAlias) string {
+	for wire, existing := range aliases {
+		if existing == identity {
+			return wire
+		}
+	}
+	key := identity.Kind + "\x00" + identity.Namespace + "\x00" + identity.Name + "\x00" + identity.Execution
+	base := identity.Namespace + identity.Name
+	if identity.Kind == "tool_search" {
+		base = "grokcli2api_tool_search"
+	}
+	if base == "" {
+		base = "grokcli2api_tool"
+	}
+	wire := base
+	if len(wire) > 128 {
+		wire = wire[:117] + "__" + inferenceShortHash(key)
+	}
+	if existing, collision := aliases[wire]; collision && existing != identity {
+		limit := 117
+		if len(base) < limit {
+			limit = len(base)
+		}
+		wire = base[:limit] + "__" + inferenceShortHash(key)
+	}
+	aliases[wire] = identity
+	return wire
+}
+
+func clientToolExecution(item map[string]any) bool {
+	execution := firstString(item, "execution")
+	return execution == "" || strings.EqualFold(execution, "client")
+}
+
 func inferenceShortHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])[:9]
 }
 
-func responsesToolChoice(raw any, tools []any) any {
-	if value, ok := raw.(string); ok {
-		switch value {
-		case "none", "auto", "required":
-			return value
+func responsesToolChoice(body map[string]any, tools []any, aliases map[string]ToolAlias) any {
+	choice := parseToolChoice(body)
+	if choice.mode != "" {
+		return choice.mode
+	}
+	declared := func(kind, name string) bool {
+		for _, rawTool := range tools {
+			tool, _ := rawTool.(map[string]any)
+			if trimmedString(tool["type"]) == kind && trimmedString(tool["name"]) == name {
+				return true
+			}
+		}
+		return false
+	}
+	if choice.name != "" {
+		for wire, alias := range aliases {
+			kindMatches := choice.kind == "tool" || choice.kind == alias.Kind
+			if kindMatches && alias.Name == choice.name && alias.Namespace == choice.namespace && declared("function", wire) {
+				return map[string]any{"type": "function", "name": wire}
+			}
+		}
+		// Cross-protocol function tools have no alias table. Also accept a
+		// client that already supplied the flattened native wire name.
+		if declared("function", choice.name) {
+			return map[string]any{"type": "function", "name": choice.name}
 		}
 		return nil
 	}
-	choice, _ := raw.(map[string]any)
-	kind, name := trimmedString(choice["type"]), trimmedString(choice["name"])
-	if kind != "function" && kind != "custom" {
-		return nil
+
+	// Grok's Responses wire accepts only the function-shaped object choice.
+	// Hosted-tool choices therefore retain the strongest portable intent.
+	raw, _ := body["tool_choice"].(map[string]any)
+	hostedKind := strings.ToLower(trimmedString(raw["type"]))
+	if hostedKind == "tool_search" {
+		for wire, alias := range aliases {
+			if alias.Kind == "tool_search" && declared("function", wire) {
+				return map[string]any{"type": "function", "name": wire}
+			}
+		}
 	}
 	for _, rawTool := range tools {
 		tool, _ := rawTool.(map[string]any)
-		if trimmedString(tool["type"]) == kind && trimmedString(tool["name"]) == name {
-			return map[string]any{"type": kind, "name": name}
+		if hostedKind != "" && trimmedString(tool["type"]) == hostedKind {
+			return "required"
 		}
 	}
 	return nil
+}
+
+func messagesToolChoice(body map[string]any, tools []any, aliases map[string]ToolAlias) any {
+	choice := parseToolChoice(body)
+	parallel, hasParallel := requestedParallelToolCalls(body)
+	var out map[string]any
+	switch {
+	case choice.mode == "none":
+		out = map[string]any{"type": "none"}
+	case choice.mode == "required":
+		out = map[string]any{"type": "any"}
+	case choice.mode == "auto":
+		out = map[string]any{"type": "auto"}
+	case choice.name != "":
+		name := toolChoiceWireName(choice, aliases)
+		for _, rawTool := range tools {
+			tool, _ := rawTool.(map[string]any)
+			if trimmedString(tool["name"]) == name {
+				out = map[string]any{"type": "tool", "name": name}
+				break
+			}
+		}
+	}
+	if out == nil && hasParallel {
+		out = map[string]any{"type": "auto"}
+	}
+	if out == nil {
+		return nil
+	}
+	if out != nil && hasParallel {
+		out["disable_parallel_tool_use"] = !parallel
+	}
+	return out
 }
 
 func (p *RequestPlan) renderNativeMessages(model string, descriptor modelcatalog.ModelDescriptor) (map[string]any, bool, error) {
@@ -762,19 +915,27 @@ func cleanNativeMessageTools(raw any) []any {
 func cleanMessageToolChoice(raw any, tools []any) any {
 	choice, _ := raw.(map[string]any)
 	kind := trimmedString(choice["type"])
+	var out map[string]any
 	switch kind {
-	case "auto", "any":
-		return map[string]any{"type": kind}
+	case "auto", "any", "none":
+		out = map[string]any{"type": kind}
 	case "tool":
 		name := trimmedString(choice["name"])
 		for _, rawTool := range tools {
 			tool, _ := rawTool.(map[string]any)
 			if trimmedString(tool["name"]) == name {
-				return map[string]any{"type": "tool", "name": name}
+				out = map[string]any{"type": "tool", "name": name}
+				break
 			}
 		}
 	}
-	return nil
+	if out == nil {
+		return nil
+	}
+	if disabled, ok := choice["disable_parallel_tool_use"].(bool); ok {
+		out["disable_parallel_tool_use"] = disabled
+	}
+	return out
 }
 
 func cleanThinking(raw any) (any, error) {

@@ -49,6 +49,13 @@ type upstreamMessageBlock struct {
 	sawInputDelta   bool
 }
 
+type upstreamChatTool struct {
+	id      string
+	name    string
+	started bool
+	pending strings.Builder
+}
+
 // backendStreamAdapter decodes any of the three upstream stream dialects and
 // re-encodes it for the public endpoint. Native dialects use a light pass
 // through, while cross-protocol routes share this canonical event state.
@@ -60,6 +67,7 @@ type backendStreamAdapter struct {
 	terminal bool
 	success  bool
 	started  bool
+	sawTool  bool
 	usage    canonicalUsage
 	stop     string
 
@@ -86,6 +94,7 @@ type backendStreamAdapter struct {
 
 	messageStarted        bool
 	messageBlocks         map[int]string
+	upstreamChatTools     map[int]*upstreamChatTool
 	upstreamMessageBlocks map[int]upstreamMessageBlock
 	messageNext           int
 	messageOptions        anthropic.ResponseOptions
@@ -100,7 +109,8 @@ func newBackendStreamAdapter(adapter inference.ResponseAdapter, model string, me
 		responseMessageIndex: -1, responseReasonIndex: -1,
 		nativeAliases: make(map[string]inference.ToolAlias), nativeArgs: make(map[string]*strings.Builder),
 		chatToolArgs:  make(map[int]*strings.Builder),
-		messageBlocks: make(map[int]string), upstreamMessageBlocks: make(map[int]upstreamMessageBlock),
+		messageBlocks: make(map[int]string), upstreamChatTools: make(map[int]*upstreamChatTool),
+		upstreamMessageBlocks: make(map[int]upstreamMessageBlock),
 	}
 	if len(messageOptions) > 0 {
 		stream.messageOptions = messageOptions[0]
@@ -133,7 +143,7 @@ func (s *backendStreamAdapter) Handle(event grok.SSEEvent) ([]grok.SSEEvent, err
 	if s.nativePair() {
 		return s.handleNative(event)
 	}
-	atoms, err := decodeStreamAtoms(s.adapter.UpstreamBackend, event, s.upstreamMessageBlocks)
+	atoms, err := decodeStreamAtoms(s.adapter.UpstreamBackend, event, s.upstreamChatTools, s.upstreamMessageBlocks)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +158,10 @@ func (s *backendStreamAdapter) Handle(event grok.SSEEvent) ([]grok.SSEEvent, err
 			}
 		}
 		if atom.kind == streamUsageAtom {
-			s.usage = atom.usage
+			s.usage = mergeUsage(s.usage, atom.usage)
+		}
+		if atom.kind == streamToolStart && atom.name != "" {
+			s.sawTool = true
 		}
 		if atom.stop != "" {
 			s.stop = atom.stop
@@ -517,18 +530,18 @@ func nativeResponseCallKeys(payload, item map[string]any) []string {
 	return keys
 }
 
-func decodeStreamAtoms(backend modelcatalog.Backend, event grok.SSEEvent, messageBlocks map[int]upstreamMessageBlock) ([]streamAtom, error) {
+func decodeStreamAtoms(backend modelcatalog.Backend, event grok.SSEEvent, chatTools map[int]*upstreamChatTool, messageBlocks map[int]upstreamMessageBlock) ([]streamAtom, error) {
 	switch backend {
 	case modelcatalog.BackendResponses:
 		return decodeResponsesAtoms(event)
 	case modelcatalog.BackendMessages:
 		return decodeMessagesAtoms(event, messageBlocks)
 	default:
-		return decodeChatAtoms(event)
+		return decodeChatAtoms(event, chatTools)
 	}
 }
 
-func decodeChatAtoms(event grok.SSEEvent) ([]streamAtom, error) {
+func decodeChatAtoms(event grok.SSEEvent, tools map[int]*upstreamChatTool) ([]streamAtom, error) {
 	if string(event.Data) == "[DONE]" {
 		return []streamAtom{{kind: streamTerminal, status: "completed"}}, nil
 	}
@@ -560,10 +573,33 @@ func decodeChatAtoms(event grok.SSEEvent) ([]streamAtom, error) {
 			call, _ := rawCall.(map[string]any)
 			index := int(intAt(call, "index"))
 			function, _ := call["function"].(map[string]any)
-			if id := firstNonEmptyString(call, "id", "call_id"); id != "" || stringAt(function, "name") != "" {
-				atoms = append(atoms, streamAtom{kind: streamToolStart, index: index, id: id, name: stringAt(function, "name")})
+			state := tools[index]
+			if state == nil {
+				state = &upstreamChatTool{}
+				if tools != nil {
+					tools[index] = state
+				}
 			}
-			if arguments := stringAt(function, "arguments"); arguments != "" {
+			if id := firstNonEmptyString(call, "id", "call_id"); id != "" {
+				state.id = id
+			}
+			if name := stringAt(function, "name"); name != "" {
+				state.name = name
+			}
+			arguments := stringAt(function, "arguments")
+			if !state.started {
+				if arguments != "" {
+					state.pending.WriteString(arguments)
+				}
+				if state.name != "" {
+					state.started = true
+					atoms = append(atoms, streamAtom{kind: streamToolStart, index: index, id: state.id, name: state.name})
+					if state.pending.Len() > 0 {
+						atoms = append(atoms, streamAtom{kind: streamToolDelta, index: index, delta: state.pending.String()})
+						state.pending.Reset()
+					}
+				}
+			} else if arguments != "" {
 				atoms = append(atoms, streamAtom{kind: streamToolDelta, index: index, delta: arguments})
 			}
 		}
@@ -729,7 +765,11 @@ func (s *backendStreamAdapter) encodeChat(atom streamAtom) []grok.SSEEvent {
 		}
 		s.terminal = true
 		s.success = atom.status == "completed" || atom.status == "incomplete"
-		finish := chatStopReason(canonicalResult{StopReason: firstNonEmpty(atom.stop, s.stop)})
+		result := canonicalResult{StopReason: firstNonEmpty(atom.stop, s.stop)}
+		if s.sawTool {
+			result.Tools = []canonicalToolCall{{}}
+		}
+		finish := chatStopReason(result)
 		if atom.status == "failed" {
 			return s.encodeError("upstream response failed", "upstream_error")
 		}
@@ -1181,7 +1221,11 @@ func (s *backendStreamAdapter) encodeMessages(atom streamAtom) []grok.SSEEvent {
 		if !s.success {
 			return append(output, s.encodeError("upstream response failed", "api_error")...)
 		}
-		stop := messagesStopReason(canonicalResult{StopReason: firstNonEmpty(atom.stop, s.stop)})
+		result := canonicalResult{StopReason: firstNonEmpty(atom.stop, s.stop)}
+		if s.sawTool {
+			result.Tools = []canonicalToolCall{{}}
+		}
+		stop := messagesStopReason(result)
 		output = append(output,
 			namedEvent("message_delta", map[string]any{
 				"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},

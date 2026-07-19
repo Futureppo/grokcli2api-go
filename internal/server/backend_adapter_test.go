@@ -140,6 +140,35 @@ func TestBackendAdapterNativeResponsesRestoresAllToolAliases(t *testing.T) {
 	}
 }
 
+func TestBackendAdapterRestoresExtendedResponsesToolsAfterBackendSwitch(t *testing.T) {
+	adapter := inference.ResponseAdapter{
+		ClientProtocol: inference.ProtocolResponses, UpstreamBackend: modelcatalog.BackendChatCompletions,
+		ToolAliases: map[string]inference.ToolAlias{
+			"calendar__create": {Kind: "function", Name: "create", Namespace: "calendar__"},
+			"shell":            {Kind: "custom", Name: "shell"},
+		},
+	}
+	payload := map[string]any{
+		"id": "chatcmpl_1", "choices": []any{map[string]any{
+			"finish_reason": "tool_calls", "message": map[string]any{"tool_calls": []any{
+				map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": "calendar__create", "arguments": `{}`}},
+				map[string]any{"id": "call_2", "type": "function", "function": map[string]any{"name": "shell", "arguments": `{"input":"echo hi"}`}},
+			}},
+		}},
+	}
+	response := adaptBackendResponse(adapter, payload, "grok-public", anthropic.ResponseOptions{})
+	output := response["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("output=%#v", output)
+	}
+	namespaced := output[0].(map[string]any)
+	custom := output[1].(map[string]any)
+	if namespaced["name"] != "create" || namespaced["namespace"] != "calendar__" ||
+		custom["type"] != "custom_tool_call" || custom["name"] != "shell" || custom["input"] != "echo hi" {
+		t.Fatalf("output=%#v", output)
+	}
+}
+
 func TestAliasedCustomInputPreservesEmptyString(t *testing.T) {
 	if got := aliasedCustomInput(""); got != "" {
 		t.Fatalf("aliasedCustomInput(\"\") = %#v", got)

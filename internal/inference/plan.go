@@ -366,6 +366,9 @@ func (p *RequestPlan) Render(descriptor modelcatalog.ModelDescriptor) (*Rendered
 	if err != nil {
 		return nil, err
 	}
+	if len(toolAliases) == 0 && p.protocol == ProtocolResponses {
+		toolAliases = p.canonical().toolAliases
+	}
 
 	effort := ""
 	if p.effortSupplied {
